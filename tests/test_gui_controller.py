@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from ggrompatcher.gui import is_tk_available, launch_gui
+import ggrompatcher.gui as gui_mod
+from ggrompatcher.gui import launch_gui
 from ggrompatcher.gui.controller import GuiController
 from ggrompatcher.models import ConsoleSystem, MatchStatus
 from tests.conftest import make_gb_rom
@@ -96,12 +98,12 @@ def test_gui_controller_fix_checksum_and_ips_tools(tmp_path: Path) -> None:
     assert (tmp_path / "chk.gb.bak").is_file()
 
 
-def test_launch_gui_handles_missing_tk_cleanly(capsys: object) -> None:
-    if not is_tk_available():
-        rc = launch_gui()
-        assert rc == 1
-        err = capsys.readouterr().err  # type: ignore[attr-defined]
-        assert "tkinter" in err
+def test_launch_gui_handles_missing_tk_cleanly(capsys: object, monkeypatch: Any) -> None:
+    monkeypatch.setattr(gui_mod, "is_tk_available", lambda: False)
+    rc = launch_gui()
+    assert rc == 1
+    err = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert "tkinter" in err
 
 
 def test_gui_controller_diff_export_bps_ups_drop_and_batch(tmp_path: Path) -> None:
