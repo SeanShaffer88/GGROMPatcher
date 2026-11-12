@@ -80,6 +80,14 @@ ggrompatcher-gui
 
 Running `ggrompatcher` with no arguments also opens the GUI when a graphical display and `tkinter` are available (otherwise it prints CLI help).
 
+### Screenshots
+
+| Patch ROM | Decoder / Encoder |
+| :---: | :---: |
+| ![Patch ROM Tab](docs/screenshots/patch-rom-tab.png) | ![Decoder / Encoder Tab](docs/screenshots/decoder-encoder-tab.png) |
+| **Patch Formats (IPS / BPS / UPS / PPF / APS)** | **Batch ROMs** |
+| ![Patch Formats Tab](docs/screenshots/patch-formats-tab.png) | ![Batch ROMs Tab](docs/screenshots/batch-roms-tab.png) |
+
 ### GUI Tabs & Shortcuts
 
 1. **Patch ROM**:
