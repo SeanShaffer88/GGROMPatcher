@@ -36,10 +36,19 @@ class UpsFormatError(PatchFormatError):
     """Raised when a UPS patch file is malformed or fails CRC/bounds checks."""
 
 
+class PpfFormatError(PatchFormatError):
+    """Raised when a PPF (1.0/2.0/3.0) patch file is malformed or fails validation."""
+
+
+class ApsFormatError(PatchFormatError):
+    """Raised when an APS (N64/GBA) patch file is malformed or fails validation."""
+
+
 class ConsoleSystem(str, Enum):
     """Supported retro console systems and raw mode."""
 
     GAMEBOY = "gameboy"
+    GBA = "gba"
     GAMEGEAR = "gamegear"
     MASTERSYSTEM = "mastersystem"
     NES = "nes"
@@ -51,6 +60,7 @@ class ConsoleSystem(str, Enum):
     def display_name(self) -> str:
         names = {
             ConsoleSystem.GAMEBOY: "Game Boy / GBC",
+            ConsoleSystem.GBA: "Game Boy Advance (GBA)",
             ConsoleSystem.GAMEGEAR: "Sega Game Gear",
             ConsoleSystem.MASTERSYSTEM: "Sega Master System",
             ConsoleSystem.NES: "NES / Famicom",
@@ -64,6 +74,7 @@ class ConsoleSystem(str, Enum):
     def has_checksum(self) -> bool:
         return self in {
             ConsoleSystem.GAMEBOY,
+            ConsoleSystem.GBA,
             ConsoleSystem.GAMEGEAR,
             ConsoleSystem.MASTERSYSTEM,
             ConsoleSystem.SNES,
@@ -80,6 +91,11 @@ class ConsoleSystem(str, Enum):
             "gameboy": cls.GAMEBOY,
             "game_boy": cls.GAMEBOY,
             "game_boy_color": cls.GAMEBOY,
+            "gba": cls.GBA,
+            "agb": cls.GBA,
+            "gameboy_advance": cls.GBA,
+            "game_boy_advance": cls.GBA,
+            "gameboyadvance": cls.GBA,
             "gg": cls.GAMEGEAR,
             "gamegear": cls.GAMEGEAR,
             "game_gear": cls.GAMEGEAR,
@@ -239,3 +255,43 @@ class BatchRomItemResult:
     applied_count: int = 0
     warnings: tuple[str, ...] = ()
     error: str = ""
+
+
+@dataclass(frozen=True)
+class RomHashes:
+    """Cryptographic and CRC32 digests for a ROM image (plus headerless payload when applicable)."""
+
+    size: int
+    crc32: str
+    md5: str
+    sha1: str
+    sha256: str
+    header_bytes: int = 0
+    headerless_size: int | None = None
+    headerless_crc32: str | None = None
+    headerless_md5: str | None = None
+    headerless_sha1: str | None = None
+
+
+@dataclass(frozen=True)
+class RomDbEntry:
+    """Canonical ROM database record imported from a Logiqx/No-Intro DAT or JSON DB."""
+
+    name: str
+    game_title: str = ""
+    system: str = ""
+    region: str = ""
+    size: int | None = None
+    crc32: str = ""
+    md5: str = ""
+    sha1: str = ""
+    headerless: bool = False
+
+
+@dataclass(frozen=True)
+class RomDbMatch:
+    """Verification match linking a ROM image to a `RomDbEntry`."""
+
+    entry: RomDbEntry
+    matched_by: str
+    via_headerless: bool = False

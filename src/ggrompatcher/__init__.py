@@ -1,5 +1,6 @@
-"""GGROMPatcher — Multi-system Game Genie ROM patcher, encoder/decoder, and IPS/BPS/UPS tool."""
+"""GGROMPatcher — Multi-system Game Genie/PAR/GSA ROM patcher and IPS/BPS/UPS/PPF/APS tool."""
 
+from ggrompatcher.aps import apply_aps, create_aps, inspect_aps, write_aps_file
 from ggrompatcher.bps import apply_bps, create_bps, inspect_bps, write_bps_file
 from ggrompatcher.cheatfiles import (
     CheatEntry,
@@ -12,6 +13,7 @@ from ggrompatcher.cheatfiles import (
 )
 from ggrompatcher.ips import apply_ips, create_ips, write_ips_file
 from ggrompatcher.models import (
+    ApsFormatError,
     BatchRomItemResult,
     BpsFormatError,
     CandidateOffset,
@@ -27,7 +29,11 @@ from ggrompatcher.models import (
     PatchFormatError,
     PatchResult,
     PlannedPatch,
+    PpfFormatError,
+    RomDbEntry,
+    RomDbMatch,
     RomFormatError,
+    RomHashes,
     RomInfo,
     UpsFormatError,
 )
@@ -52,10 +58,13 @@ from ggrompatcher.patcher import (
     plan_patches,
     preview_patch_diff,
 )
+from ggrompatcher.ppf import apply_ppf, create_ppf, inspect_ppf, write_ppf_file
+from ggrompatcher.romdb import RomDatabase, compute_rom_hashes
 from ggrompatcher.systems import detect_system, get_handler
 from ggrompatcher.ups import apply_ups, create_ups, inspect_ups, write_ups_file
 
 __all__ = [
+    "ApsFormatError",
     "BatchRomItemResult",
     "BpsFormatError",
     "CandidateOffset",
@@ -72,20 +81,30 @@ __all__ = [
     "PatchFormatError",
     "PatchResult",
     "PlannedPatch",
+    "PpfFormatError",
+    "RomDatabase",
+    "RomDbEntry",
+    "RomDbMatch",
     "RomFormatError",
+    "RomHashes",
     "RomInfo",
     "UpsFormatError",
+    "apply_aps",
     "apply_binary_patch",
     "apply_bps",
     "apply_ips",
     "apply_patches",
+    "apply_ppf",
     "apply_ups",
     "batch_patch_roms",
     "build_hex_diff_preview",
     "collect_rom_files",
+    "compute_rom_hashes",
+    "create_aps",
     "create_binary_patch",
     "create_bps",
     "create_ips",
+    "create_ppf",
     "create_ups",
     "decode_code",
     "default_patched_path",
@@ -98,7 +117,9 @@ __all__ = [
     "format_hex_diff_text",
     "format_retroarch_cht",
     "get_handler",
+    "inspect_aps",
     "inspect_bps",
+    "inspect_ppf",
     "inspect_rom",
     "inspect_ups",
     "load_cheat_file",
@@ -107,8 +128,10 @@ __all__ = [
     "patch_rom_file",
     "plan_patches",
     "preview_patch_diff",
+    "write_aps_file",
     "write_binary_patch_file",
     "write_bps_file",
     "write_ips_file",
+    "write_ppf_file",
     "write_ups_file",
 ]

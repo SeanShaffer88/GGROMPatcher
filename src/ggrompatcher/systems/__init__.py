@@ -6,6 +6,7 @@ from ggrompatcher.models import ConsoleSystem, RomFormatError
 from ggrompatcher.systems.base import SystemHandler
 from ggrompatcher.systems.gameboy import GameBoyHandler
 from ggrompatcher.systems.gamegear import GameGearHandler, MasterSystemHandler
+from ggrompatcher.systems.gba import GbaHandler
 from ggrompatcher.systems.genesis import GenesisHandler
 from ggrompatcher.systems.nes import NesHandler
 from ggrompatcher.systems.raw import RawHandler
@@ -13,6 +14,7 @@ from ggrompatcher.systems.snes import SnesHandler
 
 _HANDLERS: dict[ConsoleSystem, SystemHandler] = {
     ConsoleSystem.GAMEBOY: GameBoyHandler(),
+    ConsoleSystem.GBA: GbaHandler(),
     ConsoleSystem.GAMEGEAR: GameGearHandler(),
     ConsoleSystem.MASTERSYSTEM: MasterSystemHandler(),
     ConsoleSystem.NES: NesHandler(),

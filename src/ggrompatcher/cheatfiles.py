@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _HEX3_RE = re.compile(r"^[0-9A-Fa-f]{3}$")
+_HEX4_RE = re.compile(r"^[0-9A-Fa-f]{4}$")
+_HEX8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
 _GG_HYPHEN_RE = re.compile(
     r"^(?:[0-9A-Za-z]{3}-[0-9A-Za-z]{3}(?:-[0-9A-Za-z]{3})?|[0-9A-Za-z]{4}-[0-9A-Za-z]{4})$"
 )
@@ -17,7 +19,11 @@ _RAW_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _PREFIXED_CODE_RE = re.compile(
-    r"^(?:PAR|ROCKY|GS|AR):[0-9A-Za-z]+(?:[?:=-][0-9A-Za-z]+)*$",
+    r"^(?:PAR|PAR3|AR|AR3|ROCKY|GS|GSA|GSA1|GS1|CB|CBA):[0-9A-Za-z]+(?:[?:\s=/_-][0-9A-Za-z]+)*$",
+    re.IGNORECASE,
+)
+_PREF_HEX8_RE = re.compile(
+    r"^(?:GSA1|GS1|GSA|GS|PAR3|AR3|CB|CBA):[0-9A-Fa-f]{8}$",
     re.IGNORECASE,
 )
 
@@ -49,13 +55,16 @@ def _is_code_token(token: str) -> bool:
     )
 
 
-def parse_code_tokens(text: str) -> list[str]:
+def parse_code_tokens(text: str, *, pair_hex8: bool = False) -> list[str]:
     """Split a code expression (e.g. `A+B`, `003 E0E E6E`, `SXIOPO, AATOZE`) into codes."""
     if not text.strip():
         return []
 
     # Normalize '+' and ',' to spaces, preserve newlines as boundaries.
     codes: list[str] = []
+    two_word_prefixes = {"GSA", "GSA1", "GS", "GS1", "PAR3", "AR3", "CB", "CBA"}
+    all_prefixes = two_word_prefixes | {"PAR", "ROCKY", "AR"}
+
     for raw_segment in re.split(r"[\r\n+,;]+", text):
         parts = raw_segment.strip().split()
         if not parts:
@@ -75,11 +84,42 @@ def parse_code_tokens(text: str) -> list[str]:
                 codes.append(f"{parts[i]}-{parts[i + 1]}")
                 i += 2
             elif (
+                i + 3 < len(parts)
+                and re.match(r"^(?:PAR3|AR3):[0-9A-Fa-f]{8}$", parts[i], re.IGNORECASE)
+                and _HEX8_RE.match(parts[i + 1])
+                and _HEX8_RE.match(parts[i + 2])
+                and _HEX8_RE.match(parts[i + 3])
+            ):
+                codes.append(f"{parts[i]} {parts[i + 1]} {parts[i + 2]} {parts[i + 3]}")
+                i += 4
+            elif (
                 i + 1 < len(parts)
-                and parts[i].upper() in {"PAR", "ROCKY", "GS", "AR"}
+                and _PREF_HEX8_RE.match(parts[i])
+                and (_HEX8_RE.match(parts[i + 1]) or _HEX4_RE.match(parts[i + 1]))
+            ):
+                codes.append(f"{parts[i]} {parts[i + 1]}")
+                i += 2
+            elif (
+                i + 2 < len(parts)
+                and parts[i].upper() in two_word_prefixes
+                and _HEX8_RE.match(parts[i + 1])
+                and (_HEX8_RE.match(parts[i + 2]) or _HEX4_RE.match(parts[i + 2]))
+            ):
+                codes.append(f"{parts[i].upper()}:{parts[i + 1]} {parts[i + 2]}")
+                i += 3
+            elif (
+                i + 1 < len(parts)
+                and parts[i].upper() in all_prefixes
                 and not _is_code_token(parts[i])
             ):
                 codes.append(f"{parts[i].upper()}:{parts[i + 1]}")
+                i += 2
+            elif (
+                i + 1 < len(parts)
+                and _HEX8_RE.match(parts[i])
+                and (_HEX4_RE.match(parts[i + 1]) or (pair_hex8 and _HEX8_RE.match(parts[i + 1])))
+            ):
+                codes.append(f"{parts[i]} {parts[i + 1]}")
                 i += 2
             else:
                 codes.append(parts[i])

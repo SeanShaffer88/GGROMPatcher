@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import ggrompatcher.gui as gui_mod
 from ggrompatcher.gui import launch_gui
 from ggrompatcher.gui.controller import GuiController
 from ggrompatcher.models import ConsoleSystem, MatchStatus
-from tests.conftest import make_gb_rom
+from tests.conftest import make_gb_rom, make_gba_rom
 
 
 def test_gui_controller_full_workflow(tmp_path: Path) -> None:
@@ -169,3 +170,35 @@ def test_gui_controller_diff_export_bps_ups_drop_and_batch(tmp_path: Path) -> No
 
     ctrl.clear_batch_roms()
     assert ctrl.batch_rom_paths == []
+
+
+def test_gui_controller_gba_hashes_dat_and_ppf_aps_drop(tmp_path: Path) -> None:
+    gba = make_gba_rom(size=0x20000, title="CTRL GBA")
+    gba_path = tmp_path / "ctrl.gba"
+    gba_path.write_bytes(bytes(gba))
+
+    ctrl = GuiController()
+    info = ctrl.load_rom(gba_path)
+    assert info.system == ConsoleSystem.GBA
+
+    view = ctrl.live_decode("60000800 00001234", system=ConsoleSystem.GBA)
+    assert view.valid is True
+    assert "0x1000" in view.summary.lower() or "0x001000" in view.summary.lower()
+
+    hashes = ctrl.compute_loaded_rom_hashes()
+    assert hashes.sha1 == hashlib.sha1(gba).hexdigest()
+
+    dat_path = tmp_path / "db.json"
+    dat_path.write_text(
+        f'[{{"name": "ctrl.gba", "game_title": "Control GBA (USA)", "sha1": "{hashes.sha1}"}}]',
+        encoding="utf-8",
+    )
+    _, matches = ctrl.verify_loaded_rom_against_dat(dat_path)
+    assert len(matches) == 1
+    assert matches[0].entry.game_title == "Control GBA (USA)"
+
+    ppf_file = tmp_path / "test.ppf"
+    aps_file = tmp_path / "test.aps"
+    classified = ctrl.classify_dropped_files([gba_path, ppf_file, aps_file])
+    assert classified["roms"] == [gba_path]
+    assert classified["patches"] == [ppf_file, aps_file]
