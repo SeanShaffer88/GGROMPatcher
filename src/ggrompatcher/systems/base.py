@@ -32,7 +32,14 @@ class SystemHandler(ABC):
         """Decode a Game Genie code string into address, value, and optional compare."""
 
     @abstractmethod
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
         """Encode address, replacement value, and optional compare byte into a code."""
 
     @abstractmethod

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ggrompatcher.cheatfiles import CheatEntry, load_cheat_file, parse_cheat_text
-from ggrompatcher.ips import apply_ips, write_ips_file
+from ggrompatcher.cheatfiles import CheatEntry, export_cheat_file, load_cheat_file, parse_cheat_text
 from ggrompatcher.models import (
+    BatchRomItemResult,
     ConsoleSystem,
     DecodedCode,
+    DiffPreview,
     GGPatcherError,
     MatchStatus,
     PatchResult,
@@ -18,16 +20,24 @@ from ggrompatcher.models import (
     RomFormatError,
     RomInfo,
 )
+from ggrompatcher.patch_formats import apply_binary_patch, write_binary_patch_file
 from ggrompatcher.patcher import (
+    KNOWN_ROM_EXTENSIONS,
     apply_patches,
+    batch_patch_roms,
+    collect_rom_files,
     decode_code,
     encode_code,
     fix_rom_checksums,
     inspect_rom,
     patch_rom_file,
     plan_patches,
+    preview_patch_diff,
 )
 from ggrompatcher.systems import detect_system
+
+_CHEAT_EXTENSIONS = frozenset({".txt", ".gg", ".cht"})
+_PATCH_EXTENSIONS = frozenset({".ips", ".bps", ".ups"})
 
 
 @dataclass
@@ -75,6 +85,7 @@ class GuiController:
 
         self.entries: list[CheatEntry] = []
         self.offset_overrides: dict[int, int] = {}
+        self.batch_rom_paths: list[Path] = []
         self.all_matches: bool = False
         self.force_mismatch: bool = False
         self.fix_checksum: bool = True
@@ -204,7 +215,15 @@ class GuiController:
             decoded_items: list[DecodedCode] = []
             parts: list[str] = []
             for entry in parsed:
-                if (":" in entry.code or "=" in entry.code) and target_sys != ConsoleSystem.RAW:
+                upper = entry.code.strip().upper()
+                is_prefixed = upper.startswith(
+                    ("PAR:", "ROCKY:", "GS:", "AR:", "PAR ", "ROCKY ", "GS ", "AR ")
+                )
+                if (
+                    not is_prefixed
+                    and (":" in entry.code or "=" in entry.code)
+                    and target_sys != ConsoleSystem.RAW
+                ):
                     dec = decode_code(entry.code, system=ConsoleSystem.RAW)
                 else:
                     dec = decode_code(entry.code, system=target_sys)
@@ -225,12 +244,14 @@ class GuiController:
         addr_text: str,
         value_text: str,
         compare_text: str = "",
+        *,
+        code_format: str = "gg",
     ) -> str:
-        """Encode hex inputs into a Game Genie code string."""
+        """Encode hex inputs into a Game Genie or PAR/Rocky code string."""
         addr = _parse_hex(addr_text, "Address")
         val = _parse_hex(value_text, "New value")
         cmp_val = _parse_hex(compare_text, "Compare value") if compare_text.strip() else None
-        return encode_code(system, addr, val, cmp_val)
+        return encode_code(system, addr, val, cmp_val, code_format=code_format)
 
     def _active_indices_and_entries(self) -> tuple[list[int], list[CheatEntry]]:
         active_indices: list[int] = []
@@ -412,14 +433,46 @@ class GuiController:
             selected_offset=selected_off,
         )
 
+    def preview_current_diff(self, *, max_hunks: int = 256) -> tuple[PatchResult, DiffPreview]:
+        """Compute an in-memory hex diff preview for the currently loaded ROM and active queue."""
+        if self.rom_path is None or self.rom_bytes is None:
+            raise RomFormatError("Please open a ROM file first.")
+
+        active_indices, active_entries = self._active_indices_and_entries()
+        if not active_entries:
+            raise GGPatcherError("No enabled codes in the patch queue.")
+
+        remapped_offsets = self._remap_overrides_for_active(active_indices)
+        return preview_patch_diff(
+            self.rom_bytes,
+            active_entries,
+            system=self.active_system,
+            filename=self.rom_path.name,
+            offset_overrides=remapped_offsets,
+            all_matches=self.all_matches,
+            force=self.force_mismatch,
+            fix_checksum=self.fix_checksum,
+            strict=not self.skip_invalid,
+            max_hunks=max_hunks,
+            snes_map=self.snes_map,
+            nes_bank_size=self.nes_bank_size,
+        )
+
+    def export_cheats_to_file(self, path: str | Path, *, fmt: str | None = None) -> Path:
+        """Export current queue entries to `.txt`, `.gg`, or RetroArch `.cht`."""
+        if not self.entries:
+            raise GGPatcherError("Patch queue is empty; nothing to export.")
+        return export_cheat_file(path, self.entries, fmt=fmt)
+
     def apply_and_save(
         self,
         *,
         output_path: str | Path | None = None,
         in_place: bool = False,
         ips_output_path: str | Path | None = None,
+        patch_output_path: str | Path | None = None,
     ) -> tuple[PatchResult, Path | None]:
-        """Apply enabled queue items and write patched ROM and/or IPS file."""
+        """Apply enabled queue items and write patched ROM and/or IPS/BPS/UPS file."""
         if self.rom_path is None or self.rom_bytes is None:
             raise RomFormatError("Please open a ROM file first.")
 
@@ -429,9 +482,10 @@ class GuiController:
 
         remapped_offsets = self._remap_overrides_for_active(active_indices)
         strict = not self.skip_invalid
+        export_target = patch_output_path or ips_output_path
 
-        if ips_output_path is not None and output_path is None and not in_place:
-            # Export IPS only without writing a patched ROM file.
+        if export_target is not None and output_path is None and not in_place:
+            # Export IPS/BPS/UPS patch only without writing a patched ROM file.
             result = apply_patches(
                 self.rom_bytes,
                 active_entries,
@@ -445,16 +499,19 @@ class GuiController:
                 snes_map=self.snes_map,
                 nes_bank_size=self.nes_bank_size,
             )
-            write_ips_file(ips_output_path, self.rom_bytes, result.output_bytes)
-            return result, Path(ips_output_path)
+            write_binary_patch_file(export_target, self.rom_bytes, result.output_bytes)
+            return result, Path(export_target)
 
+        export_ext = Path(export_target).suffix.lower() if export_target else ""
         result, dest = patch_rom_file(
             self.rom_path,
             active_entries,
             output_path=output_path,
             in_place=in_place,
             backup=self.create_backup,
-            ips_output_path=ips_output_path,
+            ips_output_path=export_target if export_ext == ".ips" else None,
+            bps_output_path=export_target if export_ext == ".bps" else None,
+            ups_output_path=export_target if export_ext == ".ups" else None,
             system=self.active_system,
             offset_overrides=remapped_offsets,
             all_matches=self.all_matches,
@@ -506,25 +563,31 @@ class GuiController:
 
         return before, after, dest
 
-    def apply_ips_to_file(
+    def apply_patch_to_file(
         self,
         rom_path: str | Path,
-        ips_path: str | Path,
+        patch_path: str | Path,
         output_path: str | Path,
         *,
+        verify_checksums: bool = True,
         fix_checksum: bool = False,
         system: ConsoleSystem | None = None,
     ) -> Path:
-        """Apply an `.ips` patch to `rom_path` and write `output_path`."""
+        """Apply an `.ips`, `.bps`, or `.ups` patch to `rom_path` and write `output_path`."""
         src = Path(rom_path)
-        patch = Path(ips_path)
+        patch = Path(patch_path)
         dest = Path(output_path)
         if not src.is_file():
             raise RomFormatError(f"ROM file not found: {src}")
         if not patch.is_file():
-            raise GGPatcherError(f"IPS file not found: {patch}")
+            raise GGPatcherError(f"Patch file not found: {patch}")
 
-        patched = apply_ips(src.read_bytes(), patch.read_bytes())
+        patched = apply_binary_patch(
+            src.read_bytes(),
+            patch.read_bytes(),
+            filename=patch.name,
+            verify_checksums=verify_checksums,
+        )
         if fix_checksum:
             _, _, patched = fix_rom_checksums(
                 patched,
@@ -537,6 +600,46 @@ class GuiController:
         dest.write_bytes(patched)
         return dest
 
+    def apply_ips_to_file(
+        self,
+        rom_path: str | Path,
+        ips_path: str | Path,
+        output_path: str | Path,
+        *,
+        fix_checksum: bool = False,
+        system: ConsoleSystem | None = None,
+    ) -> Path:
+        """Apply an `.ips` patch to `rom_path` and write `output_path`."""
+        return self.apply_patch_to_file(
+            rom_path,
+            ips_path,
+            output_path,
+            fix_checksum=fix_checksum,
+            system=system,
+        )
+
+    def create_patch_from_files(
+        self,
+        original_path: str | Path,
+        modified_path: str | Path,
+        output_patch_path: str | Path,
+        *,
+        metadata: str = "",
+    ) -> Path:
+        """Generate an `.ips`, `.bps`, or `.ups` diff patch comparing two ROM files."""
+        orig = Path(original_path)
+        mod = Path(modified_path)
+        if not orig.is_file():
+            raise RomFormatError(f"Original ROM not found: {orig}")
+        if not mod.is_file():
+            raise RomFormatError(f"Modified ROM not found: {mod}")
+        return write_binary_patch_file(
+            output_patch_path,
+            orig.read_bytes(),
+            mod.read_bytes(),
+            metadata=metadata,
+        )
+
     def create_ips_from_files(
         self,
         original_path: str | Path,
@@ -544,13 +647,115 @@ class GuiController:
         output_ips_path: str | Path,
     ) -> Path:
         """Generate an `.ips` diff patch comparing two ROM files."""
-        orig = Path(original_path)
-        mod = Path(modified_path)
-        if not orig.is_file():
-            raise RomFormatError(f"Original ROM not found: {orig}")
-        if not mod.is_file():
-            raise RomFormatError(f"Modified ROM not found: {mod}")
-        return write_ips_file(output_ips_path, orig.read_bytes(), mod.read_bytes())
+        return self.create_patch_from_files(original_path, modified_path, output_ips_path)
+
+    @staticmethod
+    def parse_drop_paths(raw_drop_data: str) -> list[Path]:
+        """Parse TkDND / file-drop payload strings into `Path` objects."""
+        paths: list[Path] = []
+        i = 0
+        n = len(raw_drop_data)
+        while i < n:
+            if raw_drop_data[i].isspace():
+                i += 1
+                continue
+            if raw_drop_data[i] == "{":
+                end = raw_drop_data.find("}", i + 1)
+                if end == -1:
+                    token = raw_drop_data[i + 1 :].strip()
+                    i = n
+                else:
+                    token = raw_drop_data[i + 1 : end]
+                    i = end + 1
+            else:
+                end = i
+                while end < n and not raw_drop_data[end].isspace():
+                    end += 1
+                token = raw_drop_data[i:end]
+                i = end
+            if token:
+                paths.append(Path(token))
+        return paths
+
+    @staticmethod
+    def classify_dropped_files(paths: Sequence[str | Path]) -> dict[str, list[Path]]:
+        """Group dropped file paths into `roms`, `cheats`, and `patches`."""
+        grouped: dict[str, list[Path]] = {"roms": [], "cheats": [], "patches": []}
+        for item in paths:
+            p = Path(item)
+            if p.is_dir():
+                grouped["roms"].extend(collect_rom_files([p], recursive=False))
+                continue
+            ext = p.suffix.lower()
+            if ext in _CHEAT_EXTENSIONS:
+                grouped["cheats"].append(p)
+            elif ext in _PATCH_EXTENSIONS:
+                grouped["patches"].append(p)
+            elif ext in KNOWN_ROM_EXTENSIONS or p.is_file():
+                grouped["roms"].append(p)
+        return grouped
+
+    def add_batch_roms(self, paths: Sequence[str | Path], *, recursive: bool = False) -> list[Path]:
+        """Add ROM files or directory contents into the batch ROM queue."""
+        expanded = collect_rom_files(paths, recursive=recursive)
+        existing = {p.resolve() for p in self.batch_rom_paths}
+        added: list[Path] = []
+        for p in expanded:
+            res = p.resolve()
+            if res not in existing:
+                existing.add(res)
+                self.batch_rom_paths.append(p)
+                added.append(p)
+        return added
+
+    def remove_batch_indices(self, indices: Sequence[int]) -> None:
+        to_remove = set(indices)
+        self.batch_rom_paths = [
+            p for idx, p in enumerate(self.batch_rom_paths) if idx not in to_remove
+        ]
+
+    def clear_batch_roms(self) -> None:
+        self.batch_rom_paths.clear()
+
+    def run_batch_patch(
+        self,
+        *,
+        output_dir: str | Path | None = None,
+        in_place: bool = False,
+        patch_file: str | Path | None = None,
+        verify_patch_checksums: bool = True,
+        dry_run: bool = False,
+    ) -> list[BatchRomItemResult]:
+        """Execute batch patching across `batch_rom_paths` using queue codes or a patch file."""
+        if not self.batch_rom_paths:
+            raise RomFormatError("Add at least one ROM file to the batch list first.")
+
+        codes_arg: list[CheatEntry] | None = None
+        if patch_file is None:
+            _, active_entries = self._active_indices_and_entries()
+            if not active_entries:
+                raise GGPatcherError(
+                    "Add enabled codes to the patch queue or select a .ips/.bps/.ups patch file."
+                )
+            codes_arg = active_entries
+
+        return batch_patch_roms(
+            self.batch_rom_paths,
+            codes_arg,
+            patch_file=patch_file,
+            output_dir=output_dir,
+            in_place=in_place,
+            backup=self.create_backup,
+            verify_patch_checksums=verify_patch_checksums,
+            system=self.system_override,
+            all_matches=self.all_matches,
+            force=self.force_mismatch,
+            fix_checksum=self.fix_checksum,
+            strict=not self.skip_invalid,
+            dry_run=dry_run,
+            snes_map=self.snes_map,
+            nes_bank_size=self.nes_bank_size,
+        )
 
 
 def _parse_hex(raw: str, field_name: str) -> int:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,10 @@ _GG_HYPHEN_RE = re.compile(
 _GG_COMPACT_RE = re.compile(r"^(?:[0-9A-Za-z]{6}|[0-9A-Za-z]{8}|[0-9A-Za-z]{9})$")
 _RAW_TOKEN_RE = re.compile(
     r"^(?:0x)?[0-9A-Fa-f]+(?:\?[0-9A-Fa-f]+)?[:=](?:[0-9A-Fa-f]+(?:\?[0-9A-Fa-f]+)?)$",
+    re.IGNORECASE,
+)
+_PREFIXED_CODE_RE = re.compile(
+    r"^(?:PAR|ROCKY|GS|AR):[0-9A-Za-z]+(?:[?:=-][0-9A-Za-z]+)*$",
     re.IGNORECASE,
 )
 
@@ -37,7 +42,10 @@ def _strip_quotes(value: str) -> str:
 
 def _is_code_token(token: str) -> bool:
     return bool(
-        _GG_HYPHEN_RE.match(token) or _GG_COMPACT_RE.match(token) or _RAW_TOKEN_RE.match(token)
+        _GG_HYPHEN_RE.match(token)
+        or _GG_COMPACT_RE.match(token)
+        or _RAW_TOKEN_RE.match(token)
+        or _PREFIXED_CODE_RE.match(token)
     )
 
 
@@ -65,6 +73,13 @@ def parse_code_tokens(text: str) -> list[str]:
                 i += 3
             elif i + 1 < len(parts) and _HEX3_RE.match(parts[i]) and _HEX3_RE.match(parts[i + 1]):
                 codes.append(f"{parts[i]}-{parts[i + 1]}")
+                i += 2
+            elif (
+                i + 1 < len(parts)
+                and parts[i].upper() in {"PAR", "ROCKY", "GS", "AR"}
+                and not _is_code_token(parts[i])
+            ):
+                codes.append(f"{parts[i].upper()}:{parts[i + 1]}")
                 i += 2
             else:
                 codes.append(parts[i])
@@ -124,8 +139,13 @@ def parse_cheat_text(content: str, *, enabled_only: bool = False) -> list[CheatE
                     comment_desc = after.strip()
                     break
 
-        # Support `Description: CODE1+CODE2` when left side isn't a raw `OFFSET:HEX` patch.
-        if ":" in line and not _RAW_TOKEN_RE.match(line.split()[0]):
+        # Support `Description: CODE1+CODE2` when left side isn't a raw/prefixed code token.
+        first_word = line.split()[0]
+        if (
+            ":" in line
+            and not _RAW_TOKEN_RE.match(first_word)
+            and not _PREFIXED_CODE_RE.match(first_word)
+        ):
             left, right = line.split(":", 1)
             right_tokens = parse_code_tokens(right)
             if right_tokens and all(_is_code_token(tok) for tok in right_tokens):
@@ -209,3 +229,54 @@ def load_cheat_file(path: str | Path, *, enabled_only: bool = False) -> list[Che
     """Read and parse a `.txt`, `.gg`, or `.cht` cheat file from disk."""
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     return parse_cheat_text(text, enabled_only=enabled_only)
+
+
+def format_cheat_txt(entries: Sequence[CheatEntry]) -> str:
+    """Format `entries` as a human-readable `.txt` / `.gg` cheat sheet."""
+    lines = ["# GGROMPatcher Cheat List", ""]
+    for entry in entries:
+        prefix = "" if entry.enabled else "# [DISABLED] "
+        if entry.description:
+            lines.append(f"{prefix}{entry.code}  # {entry.description}")
+        else:
+            lines.append(f"{prefix}{entry.code}")
+    return "\n".join(lines) + "\n"
+
+
+def format_retroarch_cht(entries: Sequence[CheatEntry]) -> str:
+    """Format `entries` in RetroArch `.cht` format."""
+    lines = [f"cheats = {len(entries)}", ""]
+    for idx, entry in enumerate(entries):
+        desc_safe = entry.description.replace('"', "'")
+        code_safe = entry.code.replace('"', "'")
+        enable_str = "true" if entry.enabled else "false"
+        lines.extend(
+            [
+                f'cheat{idx}_desc = "{desc_safe}"',
+                f'cheat{idx}_code = "{code_safe}"',
+                f"cheat{idx}_enable = {enable_str}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def export_cheat_file(
+    path: str | Path,
+    entries: Sequence[CheatEntry],
+    *,
+    fmt: str | None = None,
+) -> Path:
+    """Write `entries` to `.txt`, `.gg`, or RetroArch `.cht` (format inferred from extension)."""
+    dest = Path(path)
+    kind = fmt.strip().lower().lstrip(".") if fmt else dest.suffix.lower().lstrip(".")
+    if kind == "cht":
+        content = format_retroarch_cht(entries)
+    elif kind in {"txt", "gg", ""}:
+        content = format_cheat_txt(entries)
+    else:
+        raise ValueError(f"Unsupported cheat export format '{kind}'. Use txt, gg, or cht.")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content, encoding="utf-8")
+    return dest

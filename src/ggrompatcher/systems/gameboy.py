@@ -40,7 +40,36 @@ def decode_gb_gg_code(
     description: str = "",
 ) -> DecodedCode:
     """Decode a 6- or 9-digit Game Boy / Game Gear / Master System Game Genie code."""
-    clean = clean_code_chars(code)
+    raw_upper = code.strip().upper()
+    has_gs_prefix = raw_upper.startswith(("GS:", "GS ", "AR:", "AR ", "PAR:", "PAR "))
+    body = raw_upper.split(":", 1)[1] if ":" in raw_upper and has_gs_prefix else raw_upper
+    if has_gs_prefix and " " in body and ":" not in raw_upper:
+        body = body.split(None, 1)[1]
+    clean = clean_code_chars(body.replace(":", "") if has_gs_prefix else body)
+
+    if has_gs_prefix or (len(clean) == 8 and all(ch in _HEX_DIGITS for ch in clean)):
+        if len(clean) == 8 and all(ch in _HEX_DIGITS for ch in clean):
+            if system in (ConsoleSystem.GAMEGEAR, ConsoleSystem.MASTERSYSTEM):
+                # Sega 8-bit PAR format: 00AAAALL (2-hex mode, 4-hex big-endian addr, 2-hex value)
+                gs_type = int(clean[0:2], 16)
+                gs_addr = int(clean[2:6], 16)
+                gs_val = int(clean[6:8], 16)
+            else:
+                # Game Boy GameShark format: TTVVAALL (type, val, little-endian addr)
+                gs_type = int(clean[0:2], 16)
+                gs_val = int(clean[2:4], 16)
+                gs_addr = int(clean[6:8] + clean[4:6], 16)
+            raise CodeFormatError(
+                f"{system.display_name} GameShark/Action Replay code '{code}' targets "
+                f"runtime RAM/WRAM (type=0x{gs_type:02X}, addr=0x{gs_addr:04X}, "
+                f"val=0x{gs_val:02X}); static ROM patching requires Game Genie "
+                "(6/9 hex digits) or raw file offset (OFFSET:HEX)."
+            )
+        raise CodeFormatError(
+            f"{system.display_name} GameShark/Action Replay code '{code}' targets "
+            "runtime RAM and cannot statically patch ROM files."
+        )
+
     if len(clean) not in (6, 9):
         raise CodeFormatError(
             f"Invalid {system.display_name} code '{code}': expected 6 or 9 hex digits "
@@ -147,7 +176,18 @@ class GameBoyHandler(SystemHandler):
             description=description,
         )
 
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
+        if code_format.strip().lower() != "gg":
+            raise CodeFormatError(
+                f"{self.system.display_name} ROM patching only supports Game Genie ('gg') encoding."
+            )
         return encode_gb_gg_code(
             address=address,
             value=value,

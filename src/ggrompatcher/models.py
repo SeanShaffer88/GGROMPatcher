@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -12,15 +13,27 @@ class GGPatcherError(Exception):
 
 
 class CodeFormatError(GGPatcherError):
-    """Raised when a Game Genie or raw patch code cannot be parsed or encoded."""
+    """Raised when a Game Genie, PAR, or raw patch code cannot be parsed or encoded."""
 
 
 class RomFormatError(GGPatcherError):
     """Raised when a ROM file is invalid or incompatible with the requested operation."""
 
 
-class IpsFormatError(GGPatcherError):
+class PatchFormatError(GGPatcherError):
+    """Base exception for binary patch (IPS/BPS/UPS) format errors."""
+
+
+class IpsFormatError(PatchFormatError):
     """Raised when an IPS patch file is malformed or cannot be generated."""
+
+
+class BpsFormatError(PatchFormatError):
+    """Raised when a BPS patch file is malformed or fails CRC/bounds checks."""
+
+
+class UpsFormatError(PatchFormatError):
+    """Raised when a UPS patch file is malformed or fails CRC/bounds checks."""
 
 
 class ConsoleSystem(str, Enum):
@@ -191,3 +204,38 @@ class PatchResult:
     bytes_modified: int
     output_bytes: bytes
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DiffHunk:
+    """One contiguous range of differing bytes between an original and patched ROM."""
+
+    offset: int
+    original: bytes
+    patched: bytes
+
+
+@dataclass(frozen=True)
+class DiffPreview:
+    """Human-readable and programmatic hex diff summary prior to saving."""
+
+    original_size: int
+    patched_size: int
+    bytes_changed: int
+    total_hunks: int
+    truncated: bool
+    hunks: tuple[DiffHunk, ...]
+    checksum_notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BatchRomItemResult:
+    """Outcome of patching one ROM inside a multi-ROM batch run."""
+
+    rom_path: Path
+    output_path: Path | None
+    success: bool
+    bytes_modified: int = 0
+    applied_count: int = 0
+    warnings: tuple[str, ...] = ()
+    error: str = ""

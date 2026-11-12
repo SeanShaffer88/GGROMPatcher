@@ -6,11 +6,25 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ggrompatcher.gui.controller import GuiController, PatchRowView
 from ggrompatcher.models import ConsoleSystem, GGPatcherError, MatchStatus
-from ggrompatcher.patcher import default_patched_path
+from ggrompatcher.patcher import default_patched_path, format_hex_diff_text
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore[import-not-found]
+
+    _HAS_DND = True
+except Exception:
+    DND_FILES = "DND_Files"
+    TkinterDnD = None
+    _HAS_DND = False
+
+if TYPE_CHECKING:
+    _BaseTk = tk.Tk
+else:
+    _BaseTk = TkinterDnD.Tk if _HAS_DND and TkinterDnD is not None else tk.Tk
 
 _SYSTEM_OPTIONS: list[tuple[str, ConsoleSystem | None]] = [
     ("Auto-detect", None),
@@ -36,6 +50,14 @@ _ROM_FILETYPES = [
     ("All files", "*.*"),
 ]
 
+_PATCH_FILETYPES = [
+    ("All Patch Formats", "*.ips *.bps *.ups"),
+    ("IPS Patches", "*.ips"),
+    ("BPS Patches", "*.bps"),
+    ("UPS Patches", "*.ups"),
+    ("All files", "*.*"),
+]
+
 _BG = "#0F172A"
 _CARD = "#1E293B"
 _SURFACE = "#283548"
@@ -49,7 +71,7 @@ _WARN = "#F59E0B"
 _ERR = "#EF4444"
 
 
-class GGROMPatcherApp(tk.Tk):
+class GGROMPatcherApp(_BaseTk):
     """Main desktop application window."""
 
     def __init__(self, initial_rom: str | None = None) -> None:
@@ -59,18 +81,28 @@ class GGROMPatcherApp(tk.Tk):
         self._candidate_map: dict[str, int | None] = {}
 
         self.title("GGROMPatcher — Game Genie ROM Patcher & Studio")
-        self.geometry("1120x780")
-        self.minsize(920, 660)
+        self.geometry("1160x820")
+        self.minsize(960, 680)
         self.configure(bg=_BG)
 
         self._configure_styles()
         self._build_variables()
         self._build_ui()
         self._bind_shortcuts()
-        self._log("GGROMPatcher ready. Open a ROM file (Ctrl+O) or explore the Decoder/Encoder.")
+        self._enable_drag_and_drop()
+        dnd_note = " Drag & drop enabled." if _HAS_DND else ""
+        self._log(f"GGROMPatcher ready. Open a ROM file (Ctrl+O) or explore the tabs.{dnd_note}")
 
         if initial_rom:
             self.after(50, lambda: self._load_rom_path(initial_rom))
+
+    def _enable_drag_and_drop(self) -> None:
+        if _HAS_DND and hasattr(self, "drop_target_register") and hasattr(self, "dnd_bind"):
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind("<<Drop>>", self._on_drop_event)
+            except Exception:
+                pass
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -205,19 +237,28 @@ class GGROMPatcherApp(tk.Tk):
 
         # Decoder / Encoder tab variables
         self.conv_system_var = tk.StringVar(value="Game Boy / GBC")
+        self.conv_format_var = tk.StringVar(value="Game Genie (gg)")
         self.conv_decode_in_var = tk.StringVar()
-        self.conv_decode_out_var = tk.StringVar(value="Enter a Game Genie code to decode.")
+        self.conv_decode_out_var = tk.StringVar(value="Enter a Game Genie or PAR code to decode.")
         self.conv_addr_var = tk.StringVar()
         self.conv_val_var = tk.StringVar()
         self.conv_cmp_var = tk.StringVar()
         self.conv_encode_out_var = tk.StringVar(value="")
 
-        # IPS tab variables
+        # Patch Formats (IPS / BPS / UPS) tab variables
         self.ips_apply_rom_var = tk.StringVar()
         self.ips_apply_patch_var = tk.StringVar()
         self.ips_apply_chk_var = tk.BooleanVar(value=True)
+        self.ips_verify_crc_var = tk.BooleanVar(value=True)
         self.ips_create_orig_var = tk.StringVar()
         self.ips_create_mod_var = tk.StringVar()
+        self.bps_metadata_var = tk.StringVar(value="")
+
+        # Batch ROMs tab variables
+        self.batch_source_mode_var = tk.StringVar(value="Use Active Patch Queue")
+        self.batch_patch_file_var = tk.StringVar()
+        self.batch_out_dir_var = tk.StringVar()
+        self.batch_in_place_var = tk.BooleanVar(value=False)
 
         self.code_input_var.trace_add("write", lambda *_: self._on_live_code_change())
         self.conv_decode_in_var.trace_add("write", lambda *_: self._on_conv_decode())
@@ -273,20 +314,23 @@ class GGROMPatcherApp(tk.Tk):
         self.chk_label.grid(row=0, column=3, sticky="e")
 
         # Main Notebook
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 8))
 
-        self.patch_tab = ttk.Frame(notebook, padding=8)
-        self.conv_tab = ttk.Frame(notebook, padding=12)
-        self.ips_tab = ttk.Frame(notebook, padding=12)
+        self.patch_tab = ttk.Frame(self.notebook, padding=8)
+        self.conv_tab = ttk.Frame(self.notebook, padding=12)
+        self.ips_tab = ttk.Frame(self.notebook, padding=12)
+        self.batch_tab = ttk.Frame(self.notebook, padding=10)
 
-        notebook.add(self.patch_tab, text="  Patch ROM  ")
-        notebook.add(self.conv_tab, text="  Decoder / Encoder  ")
-        notebook.add(self.ips_tab, text="  IPS Tools  ")
+        self.notebook.add(self.patch_tab, text="  Patch ROM  ")
+        self.notebook.add(self.conv_tab, text="  Decoder / Encoder  ")
+        self.notebook.add(self.ips_tab, text="  Patch Formats (IPS/BPS/UPS)  ")
+        self.notebook.add(self.batch_tab, text="  Batch ROMs  ")
 
         self._build_patch_tab()
         self._build_converter_tab()
         self._build_ips_tab()
+        self._build_batch_tab()
 
         # Activity Log Panel
         log_frame = ttk.Frame(self, style="Card.TFrame", padding=(10, 6))
@@ -479,7 +523,13 @@ class GGROMPatcherApp(tk.Tk):
 
         btns = ttk.Frame(adv, style="Card.TFrame")
         btns.grid(row=0, column=4, sticky="e")
-        ttk.Button(btns, text="Export .IPS Patch...", command=self._on_export_ips).pack(
+        ttk.Button(btns, text="Export Cheats...", command=self._on_export_cheats).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(btns, text="Export Patch (.ips/.bps/.ups)...", command=self._on_export_ips).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(btns, text="Preview Diff...", command=self._on_preview_diff).pack(
             side="right", padx=(6, 0)
         )
         ttk.Button(btns, text="Patch In-Place", command=self._on_patch_inplace).pack(
@@ -496,10 +546,10 @@ class GGROMPatcherApp(tk.Tk):
         tab = self.conv_tab
         tab.columnconfigure(0, weight=1)
 
-        # System selector
+        # System & format selector
         sys_row = ttk.Frame(tab, style="Card.TFrame", padding=10)
         sys_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(sys_row, text="Console Format:", style="SubHeader.TLabel").pack(
+        ttk.Label(sys_row, text="Console System:", style="SubHeader.TLabel").pack(
             side="left", padx=(0, 10)
         )
         conv_combo = ttk.Combobox(
@@ -507,19 +557,30 @@ class GGROMPatcherApp(tk.Tk):
             textvariable=self.conv_system_var,
             values=[label for label, sys in _SYSTEM_OPTIONS if sys is not None],
             state="readonly",
-            width=28,
+            width=26,
         )
-        conv_combo.pack(side="left")
+        conv_combo.pack(side="left", padx=(0, 16))
         conv_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_conv_decode())
+
+        ttk.Label(sys_row, text="Encode Format:", style="Card.TLabel").pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Combobox(
+            sys_row,
+            textvariable=self.conv_format_var,
+            values=["Game Genie (gg)", "Pro Action Replay / Rocky (par)"],
+            state="readonly",
+            width=28,
+        ).pack(side="left")
 
         # Decode Card
         dec_card = ttk.Frame(tab, style="Card.TFrame", padding=12)
         dec_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         dec_card.columnconfigure(1, weight=1)
 
-        ttk.Label(dec_card, text="Decode Game Genie Code", style="SubHeader.TLabel").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
-        )
+        ttk.Label(
+            dec_card, text="Decode Game Genie / Pro Action Replay Code", style="SubHeader.TLabel"
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(dec_card, text="Code:", style="Card.TLabel").grid(
             row=1, column=0, padx=(0, 8), sticky="w"
         )
@@ -541,7 +602,7 @@ class GGROMPatcherApp(tk.Tk):
         enc_card.columnconfigure(5, weight=1)
 
         ttk.Label(
-            enc_card, text="Encode Hex Address / Bytes to Game Genie Code", style="SubHeader.TLabel"
+            enc_card, text="Encode Hex Address / Bytes to Code", style="SubHeader.TLabel"
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 8))
         ttk.Label(enc_card, text="Address (hex):", style="Card.TLabel").grid(
             row=1, column=0, padx=(0, 6)
@@ -593,7 +654,9 @@ class GGROMPatcherApp(tk.Tk):
         apply_card.columnconfigure(1, weight=1)
 
         ttk.Label(
-            apply_card, text="Apply Existing .IPS Patch to ROM", style="SubHeader.TLabel"
+            apply_card,
+            text="Apply Patch File (.IPS / .BPS / .UPS) to ROM",
+            style="SubHeader.TLabel",
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Label(apply_card, text="Base ROM:", style="Card.TLabel").grid(
             row=1, column=0, padx=(0, 8), sticky="w"
@@ -607,7 +670,7 @@ class GGROMPatcherApp(tk.Tk):
             command=lambda: self._browse_into(self.ips_apply_rom_var, _ROM_FILETYPES),
         ).grid(row=1, column=2, pady=3)
 
-        ttk.Label(apply_card, text=".IPS File:", style="Card.TLabel").grid(
+        ttk.Label(apply_card, text="Patch File:", style="Card.TLabel").grid(
             row=2, column=0, padx=(0, 8), sticky="w"
         )
         ttk.Entry(apply_card, textvariable=self.ips_apply_patch_var, font=self._mono_font).grid(
@@ -616,16 +679,22 @@ class GGROMPatcherApp(tk.Tk):
         ttk.Button(
             apply_card,
             text="Browse...",
-            command=lambda: self._browse_into(
-                self.ips_apply_patch_var, [("IPS Patches", "*.ips"), ("All files", "*.*")]
-            ),
+            command=lambda: self._browse_into(self.ips_apply_patch_var, _PATCH_FILETYPES),
         ).grid(row=2, column=2, pady=3)
 
+        opt_row = ttk.Frame(apply_card, style="Card.TFrame")
+        opt_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
-            apply_card,
-            text="Auto-fix console header checksum after applying IPS",
+            opt_row,
+            text="Verify BPS/UPS CRC32 checksums",
+            variable=self.ips_verify_crc_var,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(
+            opt_row,
+            text="Auto-fix console header checksum after applying patch",
             variable=self.ips_apply_chk_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).pack(side="left")
+
         ttk.Button(
             apply_card,
             text="Apply & Save ROM As...",
@@ -639,7 +708,7 @@ class GGROMPatcherApp(tk.Tk):
 
         ttk.Label(
             create_card,
-            text="Create .IPS Patch from Original & Modified ROMs",
+            text="Create .IPS / .BPS / .UPS Patch from Original & Modified ROMs",
             style="SubHeader.TLabel",
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Label(create_card, text="Original ROM:", style="Card.TLabel").grid(
@@ -666,12 +735,117 @@ class GGROMPatcherApp(tk.Tk):
             command=lambda: self._browse_into(self.ips_create_mod_var, _ROM_FILETYPES),
         ).grid(row=2, column=2, pady=3)
 
+        ttk.Label(create_card, text="BPS Metadata (opt):", style="Muted.TLabel").grid(
+            row=3, column=0, padx=(0, 8), sticky="w"
+        )
+        ttk.Entry(create_card, textvariable=self.bps_metadata_var, font=self._mono_font).grid(
+            row=3, column=1, sticky="ew", padx=(0, 8), pady=3
+        )
         ttk.Button(
             create_card,
-            text="Create .IPS File...",
+            text="Create Patch File...",
             style="Primary.TButton",
             command=self._on_ips_create,
         ).grid(row=3, column=2, sticky="e", pady=(8, 0))
+
+    def _build_batch_tab(self) -> None:
+        tab = self.batch_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        cfg = ttk.Frame(tab, style="Card.TFrame", padding=10)
+        cfg.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        cfg.columnconfigure(1, weight=1)
+
+        ttk.Label(cfg, text="Batch ROM Source:", style="Card.TLabel").grid(
+            row=0, column=0, padx=(0, 8), sticky="w"
+        )
+        ttk.Combobox(
+            cfg,
+            textvariable=self.batch_source_mode_var,
+            values=["Use Active Patch Queue", "Apply Patch File (.ips/.bps/.ups)"],
+            state="readonly",
+            width=32,
+        ).grid(row=0, column=1, sticky="w", pady=2)
+
+        ttk.Label(cfg, text="Patch File:", style="Card.TLabel").grid(
+            row=1, column=0, padx=(0, 8), sticky="w"
+        )
+        ttk.Entry(cfg, textvariable=self.batch_patch_file_var, font=self._mono_font).grid(
+            row=1, column=1, sticky="ew", padx=(0, 8), pady=2
+        )
+        ttk.Button(
+            cfg,
+            text="Browse...",
+            command=lambda: self._browse_into(self.batch_patch_file_var, _PATCH_FILETYPES),
+        ).grid(row=1, column=2, pady=2)
+
+        ttk.Label(cfg, text="Output Folder:", style="Card.TLabel").grid(
+            row=2, column=0, padx=(0, 8), sticky="w"
+        )
+        ttk.Entry(cfg, textvariable=self.batch_out_dir_var, font=self._mono_font).grid(
+            row=2, column=1, sticky="ew", padx=(0, 8), pady=2
+        )
+        ttk.Button(cfg, text="Choose Dir...", command=self._on_batch_browse_out_dir).grid(
+            row=2, column=2, pady=2
+        )
+        ttk.Checkbutton(
+            cfg,
+            text="Overwrite ROMs in-place (ignores output folder)",
+            variable=self.batch_in_place_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        table_card = ttk.Frame(tab, style="Card.TFrame", padding=8)
+        table_card.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        table_card.columnconfigure(0, weight=1)
+        table_card.rowconfigure(0, weight=1)
+
+        self.batch_tree = ttk.Treeview(
+            table_card,
+            columns=("rom", "status", "bytes", "detail"),
+            show="headings",
+            selectmode="extended",
+        )
+        for cid, label, width in [
+            ("rom", "ROM File", 280),
+            ("status", "Status", 95),
+            ("bytes", "Bytes Changed", 110),
+            ("detail", "Output / Details", 420),
+        ]:
+            self.batch_tree.heading(cid, text=label)
+            if cid in {"status", "bytes"}:
+                self.batch_tree.column(cid, width=width, anchor="center")
+            else:
+                self.batch_tree.column(cid, width=width, anchor="w")
+        self.batch_tree.grid(row=0, column=0, sticky="nsew")
+        bscroll = ttk.Scrollbar(table_card, orient="vertical", command=self.batch_tree.yview)
+        bscroll.grid(row=0, column=1, sticky="ns")
+        self.batch_tree.configure(yscrollcommand=bscroll.set)
+
+        actions = ttk.Frame(tab, style="Card.TFrame", padding=10)
+        actions.grid(row=2, column=0, sticky="ew")
+        ttk.Button(actions, text="Add ROMs...", command=self._on_batch_add_files).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Add Folder...", command=self._on_batch_add_dir).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Remove Selected", command=self._on_batch_remove).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(actions, text="Clear List", command=self._on_batch_clear).pack(side="left")
+
+        ttk.Button(
+            actions,
+            text="Run Batch Patch",
+            style="Primary.TButton",
+            command=lambda: self._on_batch_run(dry_run=False),
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            actions,
+            text="Dry Run",
+            command=lambda: self._on_batch_run(dry_run=True),
+        ).pack(side="right")
 
     def _bind_shortcuts(self) -> None:
         self.bind("<Control-o>", lambda _e: self._on_browse_rom())
@@ -956,17 +1130,90 @@ class GGROMPatcherApp(tk.Tk):
         if self.controller.rom_path is None:
             messagebox.showwarning("No ROM", "Please open a ROM file first.")
             return
-        default_ips = self.controller.rom_path.with_suffix(".ips")
+        default_patch = self.controller.rom_path.with_suffix(".ips")
         dest = filedialog.asksaveasfilename(
-            title="Export IPS Patch",
-            initialdir=str(default_ips.parent),
-            initialfile=default_ips.name,
+            title="Export Patch File (.ips / .bps / .ups)",
+            initialdir=str(default_patch.parent),
+            initialfile=default_patch.name,
             defaultextension=".ips",
-            filetypes=[("IPS Patch", "*.ips"), ("All files", "*.*")],
+            filetypes=_PATCH_FILETYPES,
         )
         if not dest:
             return
-        self._execute_patch(output_path=None, in_place=False, ips_output_path=dest)
+        self._execute_patch(output_path=None, in_place=False, patch_output_path=dest)
+
+    def _on_preview_diff(self) -> None:
+        if self.controller.rom_path is None:
+            messagebox.showwarning("No ROM", "Please open a ROM file first.")
+            return
+        try:
+            self._sync_options()
+            _, preview = self.controller.preview_current_diff()
+            diff_text = format_hex_diff_text(preview)
+            self._show_diff_dialog(
+                f"Hex Diff Preview — {self.controller.rom_path.name}",
+                diff_text,
+            )
+            self._log(
+                f"Diff preview: {preview.bytes_changed} byte(s) changed "
+                f"across {preview.total_hunks} hunk(s)."
+            )
+        except Exception as exc:
+            messagebox.showerror("Preview Diff Error", str(exc))
+
+    def _show_diff_dialog(self, title: str, content: str) -> None:
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("760x480")
+        win.configure(bg=_BG)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+
+        txt = tk.Text(
+            win,
+            bg=_SURFACE,
+            fg=_TEXT,
+            insertbackground=_TEXT,
+            relief="flat",
+            font=self._mono_font,
+            wrap="none",
+        )
+        txt.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+        txt.insert("1.0", content)
+        txt.configure(state="disabled")
+        self._last_diff_preview_text = content
+
+        ttk.Button(win, text="Close", command=win.destroy).grid(
+            row=1, column=0, sticky="e", padx=10, pady=(0, 10)
+        )
+
+    def _on_export_cheats(self) -> None:
+        if not self.controller.entries:
+            messagebox.showwarning("Empty Queue", "Add at least one code to export.")
+            return
+        default_name = (
+            self.controller.rom_path.with_suffix(".cht").name
+            if self.controller.rom_path
+            else "cheats.cht"
+        )
+        dest = filedialog.asksaveasfilename(
+            title="Export Cheat List",
+            initialfile=default_name,
+            defaultextension=".cht",
+            filetypes=[
+                ("RetroArch Cheats", "*.cht"),
+                ("Text / Game Genie List", "*.txt *.gg"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not dest:
+            return
+        try:
+            out = self.controller.export_cheats_to_file(dest)
+            self._log(f"Exported {len(self.controller.entries)} cheat(s) -> {out}")
+            messagebox.showinfo("Cheats Exported", f"Saved cheat list -> {out}")
+        except Exception as exc:
+            messagebox.showerror("Export Error", str(exc))
 
     def _execute_patch(
         self,
@@ -974,6 +1221,7 @@ class GGROMPatcherApp(tk.Tk):
         output_path: str | None,
         in_place: bool,
         ips_output_path: str | None = None,
+        patch_output_path: str | None = None,
     ) -> None:
         try:
             self._sync_options()
@@ -981,6 +1229,7 @@ class GGROMPatcherApp(tk.Tk):
                 output_path=output_path,
                 in_place=in_place,
                 ips_output_path=ips_output_path,
+                patch_output_path=patch_output_path,
             )
             self._update_metadata_banner()
             self._refresh_table()
@@ -1037,15 +1286,17 @@ class GGROMPatcherApp(tk.Tk):
         sys_val = self._system_from_label(self.conv_system_var.get())
         if sys_val is None:
             return
+        fmt = "par" if "par" in self.conv_format_var.get().lower() else "gg"
         try:
             code = self.controller.live_encode(
                 sys_val,
                 self.conv_addr_var.get(),
                 self.conv_val_var.get(),
                 self.conv_cmp_var.get(),
+                code_format=fmt,
             )
             self.conv_encode_out_var.set(code)
-            self._log(f"Encoded [{sys_val.value}] -> {code}")
+            self._log(f"Encoded [{sys_val.value}/{fmt}] -> {code}")
         except Exception as exc:
             messagebox.showerror("Encode Error", str(exc))
 
@@ -1070,13 +1321,15 @@ class GGROMPatcherApp(tk.Tk):
 
     def _on_ips_apply(self) -> None:
         rom_p = self.ips_apply_rom_var.get().strip()
-        ips_p = self.ips_apply_patch_var.get().strip()
-        if not rom_p or not ips_p:
-            messagebox.showwarning("Missing Files", "Select both a Base ROM and an .IPS patch.")
+        patch_p = self.ips_apply_patch_var.get().strip()
+        if not rom_p or not patch_p:
+            messagebox.showwarning(
+                "Missing Files", "Select both a Base ROM and an .IPS/.BPS/.UPS patch."
+            )
             return
         default_dest = default_patched_path(rom_p)
         dest = filedialog.asksaveasfilename(
-            title="Save IPS-Patched ROM As",
+            title="Save Patched ROM As",
             initialdir=str(default_dest.parent),
             initialfile=default_dest.name,
             defaultextension=default_dest.suffix,
@@ -1085,19 +1338,20 @@ class GGROMPatcherApp(tk.Tk):
         if not dest:
             return
         try:
-            out = self.controller.apply_ips_to_file(
+            out = self.controller.apply_patch_to_file(
                 rom_p,
-                ips_p,
+                patch_p,
                 dest,
+                verify_checksums=self.ips_verify_crc_var.get(),
                 fix_checksum=self.ips_apply_chk_var.get(),
                 system=self.controller.system_override,
             )
-            msg = f"Applied IPS patch -> {out}"
+            msg = f"Applied patch -> {out}"
             self._log(msg)
-            messagebox.showinfo("IPS Applied", msg)
+            messagebox.showinfo("Patch Applied", msg)
         except Exception as exc:
-            messagebox.showerror("IPS Apply Error", str(exc))
-            self._log(f"ERROR applying IPS: {exc}")
+            messagebox.showerror("Patch Apply Error", str(exc))
+            self._log(f"ERROR applying patch: {exc}")
 
     def _on_ips_create(self) -> None:
         orig_p = self.ips_create_orig_var.get().strip()
@@ -1107,24 +1361,140 @@ class GGROMPatcherApp(tk.Tk):
                 "Missing Files", "Select both an Original ROM and a Modified ROM."
             )
             return
-        default_ips = Path(mod_p).with_suffix(".ips")
+        default_patch = Path(mod_p).with_suffix(".bps")
         dest = filedialog.asksaveasfilename(
-            title="Save Created .IPS Patch As",
-            initialdir=str(default_ips.parent),
-            initialfile=default_ips.name,
-            defaultextension=".ips",
-            filetypes=[("IPS Patch", "*.ips"), ("All files", "*.*")],
+            title="Save Created Patch As (.ips / .bps / .ups)",
+            initialdir=str(default_patch.parent),
+            initialfile=default_patch.name,
+            defaultextension=".bps",
+            filetypes=_PATCH_FILETYPES,
         )
         if not dest:
             return
         try:
-            out = self.controller.create_ips_from_files(orig_p, mod_p, dest)
-            msg = f"Created IPS patch -> {out} ({out.stat().st_size:,} bytes)"
+            out = self.controller.create_patch_from_files(
+                orig_p,
+                mod_p,
+                dest,
+                metadata=self.bps_metadata_var.get().strip(),
+            )
+            msg = f"Created patch -> {out} ({out.stat().st_size:,} bytes)"
             self._log(msg)
-            messagebox.showinfo("IPS Created", msg)
+            messagebox.showinfo("Patch Created", msg)
         except Exception as exc:
-            messagebox.showerror("IPS Creation Error", str(exc))
-            self._log(f"ERROR creating IPS: {exc}")
+            messagebox.showerror("Patch Creation Error", str(exc))
+            self._log(f"ERROR creating patch: {exc}")
+
+    def _on_drop_event(self, event: Any) -> None:
+        raw_data = str(getattr(event, "data", "") or "")
+        paths = self.controller.parse_drop_paths(raw_data)
+        self._handle_dropped_paths(paths)
+
+    def _handle_dropped_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            return
+        grouped = self.controller.classify_dropped_files(paths)
+        if grouped["roms"]:
+            self._load_rom_path(str(grouped["roms"][0]))
+            if len(grouped["roms"]) > 1:
+                added = self.controller.add_batch_roms(grouped["roms"])
+                self._refresh_batch_tree()
+                self._log(f"Added {len(added)} dropped ROM(s) to Batch ROMs list.")
+        for cht_p in grouped["cheats"]:
+            try:
+                loaded = self.controller.import_cheat_file(cht_p)
+                self._refresh_table()
+                self._log(f"Dropped cheat file '{cht_p.name}': imported {len(loaded)} code(s).")
+            except Exception as exc:
+                self._log(f"ERROR importing dropped cheat '{cht_p.name}': {exc}")
+        if grouped["patches"]:
+            p = str(grouped["patches"][0])
+            self.ips_apply_patch_var.set(p)
+            self.batch_patch_file_var.set(p)
+            self.batch_source_mode_var.set("Apply Patch File (.ips/.bps/.ups)")
+            self._log(f"Loaded dropped patch file: {Path(p).name}")
+
+    def _refresh_batch_tree(self, results: dict[Path, Any] | None = None) -> None:
+        for item_id in self.batch_tree.get_children():
+            self.batch_tree.delete(item_id)
+        for idx, rom_p in enumerate(self.controller.batch_rom_paths):
+            res = results.get(rom_p) if results else None
+            if res is None:
+                status = "QUEUED"
+                changed = "—"
+                detail = str(rom_p)
+            elif res.success:
+                status = "OK"
+                changed = str(res.bytes_modified)
+                detail = str(res.output_path) if res.output_path else "Dry run OK"
+            else:
+                status = "ERROR"
+                changed = "0"
+                detail = res.error
+            self.batch_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(rom_p.name, status, changed, detail),
+            )
+
+    def _on_batch_browse_out_dir(self) -> None:
+        chosen = filedialog.askdirectory(title="Select Batch Output Folder")
+        if chosen:
+            self.batch_out_dir_var.set(chosen)
+
+    def _on_batch_add_files(self) -> None:
+        paths = filedialog.askopenfilenames(title="Select ROM Files", filetypes=_ROM_FILETYPES)
+        if paths:
+            added = self.controller.add_batch_roms(list(paths))
+            self._refresh_batch_tree()
+            self._log(f"Added {len(added)} ROM(s) to batch queue.")
+
+    def _on_batch_add_dir(self) -> None:
+        folder = filedialog.askdirectory(title="Select Folder Containing ROMs")
+        if folder:
+            added = self.controller.add_batch_roms([folder], recursive=False)
+            self._refresh_batch_tree()
+            self._log(f"Scanned folder '{Path(folder).name}': added {len(added)} ROM(s).")
+
+    def _on_batch_remove(self) -> None:
+        indices = [int(iid) for iid in self.batch_tree.selection() if iid.isdigit()]
+        if indices:
+            self.controller.remove_batch_indices(indices)
+            self._refresh_batch_tree()
+
+    def _on_batch_clear(self) -> None:
+        self.controller.clear_batch_roms()
+        self._refresh_batch_tree()
+
+    def _on_batch_run(self, *, dry_run: bool) -> None:
+        try:
+            self._sync_options()
+            use_patch = "patch file" in self.batch_source_mode_var.get().lower()
+            patch_file = self.batch_patch_file_var.get().strip() if use_patch else None
+            if use_patch and not patch_file:
+                messagebox.showwarning("Missing Patch File", "Select a .ips/.bps/.ups patch file.")
+                return
+            in_place = self.batch_in_place_var.get()
+            out_dir = None if in_place else (self.batch_out_dir_var.get().strip() or None)
+            results = self.controller.run_batch_patch(
+                output_dir=out_dir,
+                in_place=in_place,
+                patch_file=patch_file,
+                verify_patch_checksums=self.ips_verify_crc_var.get(),
+                dry_run=dry_run,
+            )
+            by_path = {r.rom_path: r for r in results}
+            self._refresh_batch_tree(by_path)
+            ok_cnt = sum(1 for r in results if r.success)
+            fail_cnt = len(results) - ok_cnt
+            mode = "Dry run" if dry_run else "Batch patch"
+            msg = f"{mode} finished: {ok_cnt} succeeded, {fail_cnt} failed."
+            self._log(msg)
+            messagebox.showinfo("Batch Complete", msg)
+        except Exception as exc:
+            messagebox.showerror("Batch Patch Error", str(exc))
+            self._log(f"ERROR in batch run: {exc}")
 
 
 def run_app(initial_rom: str | None = None) -> int:

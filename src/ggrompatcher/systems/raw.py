@@ -85,7 +85,14 @@ class RawHandler(SystemHandler):
             description=description,
         )
 
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
         if address < 0:
             raise CodeFormatError(f"Offset 0x{address:X} must be non-negative.")
         if not 0 <= value <= 0xFFFF:

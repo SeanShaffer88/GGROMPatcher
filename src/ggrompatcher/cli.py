@@ -7,24 +7,36 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ggrompatcher.cheatfiles import CheatEntry, load_cheat_file, parse_code_tokens
-from ggrompatcher.ips import apply_ips, write_ips_file
+from ggrompatcher.cheatfiles import (
+    CheatEntry,
+    export_cheat_file,
+    load_cheat_file,
+    parse_code_tokens,
+)
 from ggrompatcher.models import (
     ConsoleSystem,
+    DiffPreview,
     GGPatcherError,
     PatchResult,
     RomInfo,
 )
+from ggrompatcher.patch_formats import apply_binary_patch, write_binary_patch_file
 from ggrompatcher.patcher import (
+    batch_patch_roms,
+    build_hex_diff_preview,
+    collect_rom_files,
     decode_code,
     default_patched_path,
     encode_code,
     fix_rom_checksums,
+    format_hex_diff_text,
     inspect_rom,
     patch_rom_file,
+    preview_patch_diff,
 )
 
 
@@ -163,18 +175,38 @@ def _cmd_decode(args: argparse.Namespace) -> int:
     return 0
 
 
+def _diff_preview_to_dict(preview: DiffPreview) -> dict[str, Any]:
+    return {
+        "original_size": preview.original_size,
+        "patched_size": preview.patched_size,
+        "bytes_changed": preview.bytes_changed,
+        "total_hunks": preview.total_hunks,
+        "truncated": preview.truncated,
+        "checksum_notes": list(preview.checksum_notes),
+        "hunks": [
+            {
+                "offset": f"0x{h.offset:06X}",
+                "original": h.original.hex().upper(),
+                "patched": h.patched.hex().upper(),
+            }
+            for h in preview.hunks
+        ],
+    }
+
+
 def _cmd_encode(args: argparse.Namespace) -> int:
     addr = parse_hex_int(args.addr)
     val = parse_hex_int(args.value)
     cmp_val = parse_hex_int(args.compare) if args.compare is not None else None
     sys_type = ConsoleSystem.from_str(args.system)
-    code = encode_code(sys_type, addr, val, cmp_val)
+    code = encode_code(sys_type, addr, val, cmp_val, code_format=args.format)
 
     if args.json:
         print(
             json.dumps(
                 {
                     "system": sys_type.value,
+                    "format": args.format,
                     "address": f"0x{addr:06X}",
                     "value": f"0x{val:02X}",
                     "compare": f"0x{cmp_val:02X}" if cmp_val is not None else None,
@@ -237,6 +269,8 @@ def _cmd_patch(args: argparse.Namespace) -> int:
         in_place=args.in_place,
         backup=not args.no_backup,
         ips_output_path=args.ips_out,
+        bps_output_path=args.bps_out,
+        ups_output_path=args.ups_out,
         system=args.system,
         bank=bank,
         all_matches=args.all_matches,
@@ -248,8 +282,33 @@ def _cmd_patch(args: argparse.Namespace) -> int:
         nes_bank_size=args.nes_bank_size,
     )
 
+    if args.export_cheats:
+        cheat_entries = [
+            CheatEntry(code=tok, description="") if isinstance(tok, str) else tok for tok in entries
+        ]
+        export_cheat_file(args.export_cheats, cheat_entries)
+
+    diff_preview: DiffPreview | None = None
+    if args.preview_diff:
+        _, diff_preview = preview_patch_diff(
+            rom_path.read_bytes(),
+            entries,
+            system=args.system,
+            filename=rom_path.name,
+            bank=bank,
+            all_matches=args.all_matches,
+            force=args.force,
+            fix_checksum=not args.no_checksum,
+            strict=False,
+            snes_map=args.snes_map,
+            nes_bank_size=args.nes_bank_size,
+        )
+
     if args.json:
-        print(json.dumps(_patch_result_to_dict(result, out_path), indent=2))
+        payload = _patch_result_to_dict(result, out_path)
+        if diff_preview is not None:
+            payload["diff"] = _diff_preview_to_dict(diff_preview)
+        print(json.dumps(payload, indent=2))
     else:
         print(
             f"ROM: {rom_path.name} ({result.rom_info_before.system.display_name}, "
@@ -281,6 +340,15 @@ def _cmd_patch(args: argparse.Namespace) -> int:
                 print(f"Checksums updated: {chk_summary}")
             if args.ips_out:
                 print(f"IPS patch exported -> {args.ips_out}")
+            if args.bps_out:
+                print(f"BPS patch exported -> {args.bps_out}")
+            if args.ups_out:
+                print(f"UPS patch exported -> {args.ups_out}")
+            if args.export_cheats:
+                print(f"Cheat sheet exported -> {args.export_cheats}")
+        if diff_preview is not None:
+            print()
+            print(format_hex_diff_text(diff_preview))
 
     has_failures = any(not p.can_apply for p in result.planned_patches)
     if args.dry_run and has_failures:
@@ -335,7 +403,7 @@ def _cmd_fix_checksum(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_ips_create(args: argparse.Namespace) -> int:
+def _cmd_binary_patch_create(args: argparse.Namespace, fmt: str) -> int:
     orig_path = Path(args.original)
     mod_path = Path(args.modified)
     if not orig_path.is_file():
@@ -343,23 +411,37 @@ def _cmd_ips_create(args: argparse.Namespace) -> int:
     if not mod_path.is_file():
         raise GGPatcherError(f"Modified ROM not found: {mod_path}")
 
-    out_path = write_ips_file(args.output, orig_path.read_bytes(), mod_path.read_bytes())
-    print(f"IPS patch written -> {out_path} ({out_path.stat().st_size:,} bytes)")
+    metadata = getattr(args, "metadata", "") or ""
+    out_path = write_binary_patch_file(
+        args.output,
+        orig_path.read_bytes(),
+        mod_path.read_bytes(),
+        fmt=fmt,
+        metadata=metadata,
+    )
+    print(f"{fmt.upper()} patch written -> {out_path} ({out_path.stat().st_size:,} bytes)")
     return 0
 
 
-def _cmd_ips_apply(args: argparse.Namespace) -> int:
+def _cmd_binary_patch_apply(args: argparse.Namespace, fmt: str) -> int:
     rom_path = Path(args.rom)
-    ips_path = Path(args.ips)
+    patch_path = Path(args.patch)
     if not rom_path.is_file():
         raise GGPatcherError(f"ROM file not found: {rom_path}")
-    if not ips_path.is_file():
-        raise GGPatcherError(f"IPS patch not found: {ips_path}")
+    if not patch_path.is_file():
+        raise GGPatcherError(f"{fmt.upper()} patch not found: {patch_path}")
     if args.in_place and args.output:
         raise GGPatcherError("Cannot specify both --in-place and --output.")
 
     dest = rom_path if args.in_place else Path(args.output or default_patched_path(rom_path))
-    patched = apply_ips(rom_path.read_bytes(), ips_path.read_bytes())
+    verify = not getattr(args, "ignore_checksums", False)
+    patched = apply_binary_patch(
+        rom_path.read_bytes(),
+        patch_path.read_bytes(),
+        fmt=fmt,
+        filename=patch_path.name,
+        verify_checksums=verify,
+    )
 
     if args.fix_checksum:
         _, _, patched = fix_rom_checksums(
@@ -373,8 +455,153 @@ def _cmd_ips_apply(args: argparse.Namespace) -> int:
         shutil.copy2(rom_path, rom_path.with_name(f"{rom_path.name}.bak"))
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(patched)
-    print(f"Applied {ips_path.name} -> {dest} ({len(patched):,} bytes)")
+    print(f"Applied {patch_path.name} -> {dest} ({len(patched):,} bytes)")
     return 0
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    orig_path = Path(args.original)
+    if not orig_path.is_file():
+        raise GGPatcherError(f"Original ROM not found: {orig_path}")
+
+    entries: list[str | CheatEntry] = []
+    for raw in args.code or []:
+        entries.extend(parse_code_tokens(raw))
+    for cheat_path in args.cheat_file or []:
+        p = Path(cheat_path)
+        if not p.is_file():
+            raise GGPatcherError(f"Cheat file not found: {p}")
+        entries.extend(load_cheat_file(p, enabled_only=args.enabled_only))
+
+    if args.modified is not None and not entries:
+        mod_path = Path(args.modified)
+        if not mod_path.is_file():
+            raise GGPatcherError(f"Modified ROM not found: {mod_path}")
+        preview = build_hex_diff_preview(
+            orig_path.read_bytes(),
+            mod_path.read_bytes(),
+            max_hunks=args.max_hunks,
+        )
+    elif entries and args.modified is None:
+        bank = parse_int_auto(args.bank) if args.bank is not None else None
+        _, preview = preview_patch_diff(
+            orig_path.read_bytes(),
+            entries,
+            system=args.system,
+            filename=orig_path.name,
+            bank=bank,
+            all_matches=args.all_matches,
+            force=args.force,
+            fix_checksum=not args.no_checksum,
+            strict=not args.skip_invalid,
+            max_hunks=args.max_hunks,
+            snes_map=args.snes_map,
+            nes_bank_size=args.nes_bank_size,
+        )
+    else:
+        raise GGPatcherError(
+            "Provide either two ROM paths (ORIGINAL MODIFIED) or ORIGINAL with -c/-f codes."
+        )
+
+    if args.json:
+        print(json.dumps(_diff_preview_to_dict(preview), indent=2))
+    else:
+        print(format_hex_diff_text(preview))
+    return 0
+
+
+def _cmd_export_cheats(args: argparse.Namespace) -> int:
+    entries: list[CheatEntry] = []
+    for raw in args.code or []:
+        for tok in parse_code_tokens(raw):
+            entries.append(CheatEntry(code=tok))
+    for cheat_path in args.cheat_file or []:
+        p = Path(cheat_path)
+        if not p.is_file():
+            raise GGPatcherError(f"Cheat file not found: {p}")
+        entries.extend(load_cheat_file(p, enabled_only=args.enabled_only))
+
+    if not entries:
+        raise GGPatcherError("No codes provided. Use --code and/or --cheat-file.")
+
+    out_path = export_cheat_file(args.output, entries, fmt=args.format)
+    print(f"Exported {len(entries)} cheat(s) -> {out_path}")
+    return 0
+
+
+def _cmd_batch_patch(args: argparse.Namespace) -> int:
+    rom_files = collect_rom_files(args.inputs, recursive=args.recursive)
+    if not rom_files:
+        raise GGPatcherError("No ROM files matched the provided input path(s).")
+
+    entries: list[str | CheatEntry] = []
+    for raw in args.code or []:
+        entries.extend(parse_code_tokens(raw))
+    for cheat_path in args.cheat_file or []:
+        p = Path(cheat_path)
+        if not p.is_file():
+            raise GGPatcherError(f"Cheat file not found: {p}")
+        entries.extend(load_cheat_file(p, enabled_only=args.enabled_only))
+
+    bank = parse_int_auto(args.bank) if args.bank is not None else None
+    results = batch_patch_roms(
+        rom_files,
+        entries if entries else None,
+        patch_file=args.patch_file,
+        output_dir=args.out_dir,
+        in_place=args.in_place,
+        backup=not args.no_backup,
+        verify_patch_checksums=not args.ignore_checksums,
+        system=args.system,
+        bank=bank,
+        all_matches=args.all_matches,
+        force=args.force,
+        fix_checksum=not args.no_checksum,
+        strict=not args.skip_invalid,
+        dry_run=args.dry_run,
+        snes_map=args.snes_map,
+        nes_bank_size=args.nes_bank_size,
+    )
+
+    if args.json:
+        payload = [
+            {
+                "rom": str(r.rom_path),
+                "output_path": str(r.output_path) if r.output_path else None,
+                "success": r.success,
+                "bytes_modified": r.bytes_modified,
+                "applied_count": r.applied_count,
+                "warnings": list(r.warnings),
+                "error": r.error,
+            }
+            for r in results
+        ]
+        print(json.dumps(payload, indent=2))
+    else:
+        for r in results:
+            tag = "OK" if r.success else "ERR"
+            detail = (
+                f"{r.bytes_modified} byte(s) changed -> {r.output_path or '(dry-run)'}"
+                if r.success
+                else r.error
+            )
+            print(f"[{tag}] {r.rom_path.name:<28} {detail}")
+
+    return 0 if all(r.success for r in results) else 2
+
+
+def _make_patch_create_cmd(fmt: str) -> Callable[[argparse.Namespace], int]:
+    def _handler(args: argparse.Namespace) -> int:
+        return _cmd_binary_patch_create(args, fmt)
+
+    return _handler
+
+
+def _make_patch_apply_cmd(fmt: str) -> Callable[[argparse.Namespace], int]:
+    def _handler(args: argparse.Namespace) -> int:
+        return _cmd_binary_patch_apply(args, fmt)
+
+    return _handler
 
 
 def _cmd_gui(args: argparse.Namespace) -> int:
@@ -409,11 +636,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_dec.set_defaults(func=_cmd_decode)
 
     # encode
-    p_enc = sub.add_parser("encode", help="Encode an address and value into a Game Genie code.")
+    p_enc = sub.add_parser("encode", help="Encode an address and value into a Game Genie/PAR code.")
     p_enc.add_argument("-s", "--system", required=True, help="Console system.")
     p_enc.add_argument("-a", "--addr", required=True, help="Target address in hex (e.g. 0x14BC).")
     p_enc.add_argument("-v", "--value", required=True, help="Replacement value in hex (e.g. 0x00).")
     p_enc.add_argument("-c", "--compare", help="Optional compare byte in hex (GB/GG/SMS/NES).")
+    p_enc.add_argument(
+        "--format",
+        default="gg",
+        choices=["gg", "par", "rocky"],
+        help="Code format: 'gg' (Game Genie) or 'par'/'rocky' (SNES/Genesis/NES PAR).",
+    )
     p_enc.add_argument("--json", action="store_true", help="Output JSON.")
     p_enc.set_defaults(func=_cmd_encode)
 
@@ -492,6 +725,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve and validate codes without writing output files.",
     )
     p_pat.add_argument("--ips-out", help="Also export an .ips patch file.")
+    p_pat.add_argument("--bps-out", help="Also export a .bps patch file.")
+    p_pat.add_argument("--ups-out", help="Also export a .ups patch file.")
+    p_pat.add_argument(
+        "--preview-diff",
+        action="store_true",
+        help="Show a hex diff preview of modified bytes.",
+    )
+    p_pat.add_argument(
+        "--export-cheats",
+        help="Export parsed queue codes to a .txt, .gg, or RetroArch .cht file.",
+    )
     p_pat.add_argument("--json", action="store_true", help="Output JSON.")
     p_pat.set_defaults(func=_cmd_patch)
 
@@ -511,27 +755,109 @@ def build_parser() -> argparse.ArgumentParser:
     p_chk.add_argument("--json", action="store_true", help="Output JSON.")
     p_chk.set_defaults(func=_cmd_fix_checksum)
 
-    # ips-create
-    p_ic = sub.add_parser("ips-create", help="Create an IPS patch from original & modified ROMs.")
-    p_ic.add_argument("original", help="Original unpatched ROM file.")
-    p_ic.add_argument("modified", help="Modified ROM file.")
-    p_ic.add_argument("-o", "--output", required=True, help="Output .ips file path.")
-    p_ic.set_defaults(func=_cmd_ips_create)
+    # ips-create / bps-create / ups-create
+    for fmt_name in ("ips", "bps", "ups"):
+        p_pc = sub.add_parser(
+            f"{fmt_name}-create",
+            help=f"Create a {fmt_name.upper()} patch from original & modified ROMs.",
+        )
+        p_pc.add_argument("original", help="Original unpatched ROM file.")
+        p_pc.add_argument("modified", help="Modified ROM file.")
+        p_pc.add_argument("-o", "--output", required=True, help=f"Output .{fmt_name} file path.")
+        if fmt_name == "bps":
+            p_pc.add_argument("--metadata", default="", help="Optional BPS UTF-8 metadata.")
+        p_pc.set_defaults(func=_make_patch_create_cmd(fmt_name))
 
-    # ips-apply
-    p_ia = sub.add_parser("ips-apply", help="Apply an IPS patch to a ROM.")
-    p_ia.add_argument("rom", help="Original ROM file.")
-    p_ia.add_argument("ips", help="IPS patch file.")
-    p_ia.add_argument("-o", "--output", help="Output patched ROM file.")
-    p_ia.add_argument("-i", "--in-place", action="store_true", help="Overwrite ROM in place.")
-    p_ia.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
-    p_ia.add_argument(
-        "--fix-checksum",
-        action="store_true",
-        help="Recalculate console checksum after applying IPS.",
+        p_pa = sub.add_parser(
+            f"{fmt_name}-apply",
+            help=f"Apply a {fmt_name.upper()} patch to a ROM.",
+        )
+        p_pa.add_argument("rom", help="Original ROM file.")
+        p_pa.add_argument("patch", metavar=fmt_name.upper(), help=f"{fmt_name.upper()} patch file.")
+        p_pa.add_argument("-o", "--output", help="Output patched ROM file.")
+        p_pa.add_argument("-i", "--in-place", action="store_true", help="Overwrite ROM in place.")
+        p_pa.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
+        if fmt_name in {"bps", "ups"}:
+            p_pa.add_argument(
+                "--ignore-checksums",
+                action="store_true",
+                help=f"Skip {fmt_name.upper()} CRC32/size verification.",
+            )
+        p_pa.add_argument(
+            "--fix-checksum",
+            action="store_true",
+            help=f"Recalculate console checksum after applying {fmt_name.upper()}.",
+        )
+        p_pa.add_argument("-s", "--system", help="Console system for --fix-checksum.")
+        p_pa.set_defaults(func=_make_patch_apply_cmd(fmt_name))
+
+    # diff
+    p_diff = sub.add_parser(
+        "diff",
+        help="Show hex diff hunks between original & modified ROMs or planned cheat patches.",
     )
-    p_ia.add_argument("-s", "--system", help="Console system for --fix-checksum.")
-    p_ia.set_defaults(func=_cmd_ips_apply)
+    p_diff.add_argument("original", help="Original ROM file.")
+    p_diff.add_argument("modified", nargs="?", help="Modified ROM file (optional if -c/-f used).")
+    p_diff.add_argument("-c", "--code", action="append", help="Game Genie/PAR code(s) to preview.")
+    p_diff.add_argument("-f", "--cheat-file", action="append", help="Cheat file(s) to preview.")
+    p_diff.add_argument("--enabled-only", action="store_true", help="Only import enabled cheats.")
+    p_diff.add_argument("-s", "--system", help="Override console system.")
+    p_diff.add_argument(
+        "--snes-map",
+        default="auto",
+        choices=["auto", "lorom", "hirom", "exhirom", "exlorom"],
+    )
+    p_diff.add_argument("--nes-bank-size", default="auto", choices=["auto", "8k", "16k", "32k"])
+    p_diff.add_argument("--bank", help="Explicit bank index.")
+    p_diff.add_argument("--all-matches", action="store_true", help="Patch all matching banks.")
+    p_diff.add_argument("--force", action="store_true", help="Force on compare mismatch.")
+    p_diff.add_argument("--no-checksum", action="store_true", help="Skip checksum recalculation.")
+    p_diff.add_argument("--skip-invalid", action="store_true", help="Skip non-matching codes.")
+    p_diff.add_argument("--max-hunks", type=int, default=256, help="Maximum hunks to display.")
+    p_diff.add_argument("--json", action="store_true", help="Output JSON.")
+    p_diff.set_defaults(func=_cmd_diff)
+
+    # export-cheats
+    p_exp = sub.add_parser(
+        "export-cheats", help="Convert/export codes to .txt, .gg, or RetroArch .cht."
+    )
+    p_exp.add_argument("-c", "--code", action="append", help="Cheat code(s).")
+    p_exp.add_argument("-f", "--cheat-file", action="append", help="Input cheat file(s).")
+    p_exp.add_argument("--enabled-only", action="store_true", help="Only keep enabled entries.")
+    p_exp.add_argument("-o", "--output", required=True, help="Output .txt/.gg/.cht path.")
+    p_exp.add_argument("--format", choices=["txt", "gg", "cht"], help="Override output format.")
+    p_exp.set_defaults(func=_cmd_export_cheats)
+
+    # batch-patch
+    p_bp = sub.add_parser(
+        "batch-patch",
+        help="Batch apply Game Genie/PAR codes or a binary patch across multiple ROMs/folders.",
+    )
+    p_bp.add_argument("inputs", nargs="+", metavar="ROM_OR_DIR", help="ROM file(s) or folder(s).")
+    p_bp.add_argument("-c", "--code", action="append", help="Game Genie/PAR code(s).")
+    p_bp.add_argument("-f", "--cheat-file", action="append", help="Input cheat file(s).")
+    p_bp.add_argument("--enabled-only", action="store_true", help="Only import enabled cheats.")
+    p_bp.add_argument("--patch-file", help="Apply an .ips, .bps, or .ups patch to each ROM.")
+    p_bp.add_argument("--out-dir", help="Directory for output ROMs.")
+    p_bp.add_argument("-i", "--in-place", action="store_true", help="Patch ROMs in place.")
+    p_bp.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
+    p_bp.add_argument("--recursive", action="store_true", help="Recurse into directories.")
+    p_bp.add_argument("-s", "--system", help="Override console system.")
+    p_bp.add_argument(
+        "--snes-map",
+        default="auto",
+        choices=["auto", "lorom", "hirom", "exhirom", "exlorom"],
+    )
+    p_bp.add_argument("--nes-bank-size", default="auto", choices=["auto", "8k", "16k", "32k"])
+    p_bp.add_argument("--bank", help="Explicit bank index.")
+    p_bp.add_argument("--all-matches", action="store_true", help="Patch all matching banks.")
+    p_bp.add_argument("--force", action="store_true", help="Force on compare mismatch.")
+    p_bp.add_argument("--no-checksum", action="store_true", help="Skip checksum recalculation.")
+    p_bp.add_argument("--skip-invalid", action="store_true", help="Skip non-matching codes.")
+    p_bp.add_argument("--ignore-checksums", action="store_true", help="Skip BPS/UPS CRC checks.")
+    p_bp.add_argument("--dry-run", action="store_true", help="Validate without writing files.")
+    p_bp.add_argument("--json", action="store_true", help="Output JSON.")
+    p_bp.set_defaults(func=_cmd_batch_patch)
 
     return parser
 
