@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
+import ggrompatcher.cli as cli_mod
 from ggrompatcher.cli import main
 from tests.conftest import make_gb_rom, make_nes_rom
 
@@ -87,11 +89,25 @@ def test_cli_fix_checksum_and_ips_roundtrip(tmp_path: Path) -> None:
     assert applied_p.read_bytes() == mod_p.read_bytes()
 
 
-def test_cli_no_args_headless_and_errors(capsys: object) -> None:
-    # In headless sandbox without DISPLAY/tkinter, main([]) exits 0 with help
+def test_cli_no_args_headless_and_errors(capsys: object, monkeypatch: Any) -> None:
+    # Ensure main([]) prints CLI help cleanly when GUI auto-launch is unavailable.
+    monkeypatch.setattr(cli_mod, "_can_launch_default_gui", lambda: False)
     assert main([]) == 0
     out = capsys.readouterr().out  # type: ignore[attr-defined]
     assert "GGROMPatcher" in out
+
+    # Also verify main([]) delegates to launch_gui when display + tk are available.
+    called: list[str] = []
+
+    def _fake_launch() -> int:
+        called.append("ok")
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_can_launch_default_gui", lambda: True)
+    monkeypatch.setattr("ggrompatcher.gui.is_tk_available", lambda: True)
+    monkeypatch.setattr("ggrompatcher.gui.launch_gui", _fake_launch)
+    assert main([]) == 0
+    assert called == ["ok"]
 
     # Missing file returns exit code 1 cleanly
     assert main(["inspect", "/nonexistent/rom.gb"]) == 1
