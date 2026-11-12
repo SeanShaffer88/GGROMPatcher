@@ -29,6 +29,7 @@ else:
 _SYSTEM_OPTIONS: list[tuple[str, ConsoleSystem | None]] = [
     ("Auto-detect", None),
     ("Game Boy / GBC", ConsoleSystem.GAMEBOY),
+    ("Game Boy Advance (GBA)", ConsoleSystem.GBA),
     ("Sega Game Gear", ConsoleSystem.GAMEGEAR),
     ("Sega Master System", ConsoleSystem.MASTERSYSTEM),
     ("NES / Famicom", ConsoleSystem.NES),
@@ -40,9 +41,11 @@ _SYSTEM_OPTIONS: list[tuple[str, ConsoleSystem | None]] = [
 _ROM_FILETYPES = [
     (
         "Supported ROMs",
-        "*.gb *.gbc *.sgb *.gg *.sms *.nes *.sfc *.smc *.swc *.fig *.bin *.md *.gen *.smd",
+        "*.gb *.gbc *.sgb *.gba *.agb *.gg *.sms *.nes "
+        "*.sfc *.smc *.swc *.fig *.bin *.md *.gen *.smd",
     ),
     ("Game Boy / GBC", "*.gb *.gbc *.sgb"),
+    ("Game Boy Advance", "*.gba *.agb"),
     ("Sega Game Gear / Master System", "*.gg *.sms"),
     ("NES / Famicom", "*.nes"),
     ("Super Nintendo", "*.sfc *.smc *.swc *.fig"),
@@ -51,10 +54,12 @@ _ROM_FILETYPES = [
 ]
 
 _PATCH_FILETYPES = [
-    ("All Patch Formats", "*.ips *.bps *.ups"),
+    ("All Patch Formats", "*.ips *.bps *.ups *.ppf *.aps"),
     ("IPS Patches", "*.ips"),
     ("BPS Patches", "*.bps"),
     ("UPS Patches", "*.ups"),
+    ("PPF Patches", "*.ppf"),
+    ("APS Patches", "*.aps"),
     ("All files", "*.*"),
 ]
 
@@ -324,7 +329,7 @@ class GGROMPatcherApp(_BaseTk):
 
         self.notebook.add(self.patch_tab, text="  Patch ROM  ")
         self.notebook.add(self.conv_tab, text="  Decoder / Encoder  ")
-        self.notebook.add(self.ips_tab, text="  Patch Formats (IPS/BPS/UPS)  ")
+        self.notebook.add(self.ips_tab, text="  Patch Formats (IPS/BPS/UPS/PPF/APS)  ")
         self.notebook.add(self.batch_tab, text="  Batch ROMs  ")
 
         self._build_patch_tab()
@@ -526,9 +531,9 @@ class GGROMPatcherApp(_BaseTk):
         ttk.Button(btns, text="Export Cheats...", command=self._on_export_cheats).pack(
             side="right", padx=(6, 0)
         )
-        ttk.Button(btns, text="Export Patch (.ips/.bps/.ups)...", command=self._on_export_ips).pack(
-            side="right", padx=(6, 0)
-        )
+        ttk.Button(
+            btns, text="Export Patch (.ips/.bps/.ups/.ppf/.aps)...", command=self._on_export_ips
+        ).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="Preview Diff...", command=self._on_preview_diff).pack(
             side="right", padx=(6, 0)
         )
@@ -568,9 +573,14 @@ class GGROMPatcherApp(_BaseTk):
         ttk.Combobox(
             sys_row,
             textvariable=self.conv_format_var,
-            values=["Game Genie (gg)", "Pro Action Replay / Rocky (par)"],
+            values=[
+                "Game Genie (gg)",
+                "Pro Action Replay / Rocky (par)",
+                "GameShark Advance v1 Raw (gsa)",
+                "GameShark Advance v1 Encrypted (gsa1)",
+            ],
             state="readonly",
-            width=28,
+            width=36,
         ).pack(side="left")
 
         # Decode Card
@@ -763,9 +773,9 @@ class GGROMPatcherApp(_BaseTk):
         ttk.Combobox(
             cfg,
             textvariable=self.batch_source_mode_var,
-            values=["Use Active Patch Queue", "Apply Patch File (.ips/.bps/.ups)"],
+            values=["Use Active Patch Queue", "Apply Patch File (.ips/.bps/.ups/.ppf/.aps)"],
             state="readonly",
-            width=32,
+            width=38,
         ).grid(row=0, column=1, sticky="w", pady=2)
 
         ttk.Label(cfg, text="Patch File:", style="Card.TLabel").grid(
@@ -1132,7 +1142,7 @@ class GGROMPatcherApp(_BaseTk):
             return
         default_patch = self.controller.rom_path.with_suffix(".ips")
         dest = filedialog.asksaveasfilename(
-            title="Export Patch File (.ips / .bps / .ups)",
+            title="Export Patch File (.ips / .bps / .ups / .ppf / .aps)",
             initialdir=str(default_patch.parent),
             initialfile=default_patch.name,
             defaultextension=".ips",
@@ -1286,7 +1296,15 @@ class GGROMPatcherApp(_BaseTk):
         sys_val = self._system_from_label(self.conv_system_var.get())
         if sys_val is None:
             return
-        fmt = "par" if "par" in self.conv_format_var.get().lower() else "gg"
+        raw_fmt = self.conv_format_var.get().lower()
+        if "gsa1" in raw_fmt:
+            fmt = "gsa1"
+        elif "gsa" in raw_fmt:
+            fmt = "gsa"
+        elif "par" in raw_fmt:
+            fmt = "par"
+        else:
+            fmt = "gg"
         try:
             code = self.controller.live_encode(
                 sys_val,
@@ -1324,7 +1342,8 @@ class GGROMPatcherApp(_BaseTk):
         patch_p = self.ips_apply_patch_var.get().strip()
         if not rom_p or not patch_p:
             messagebox.showwarning(
-                "Missing Files", "Select both a Base ROM and an .IPS/.BPS/.UPS patch."
+                "Missing Files",
+                "Select both a Base ROM and a binary patch (.ips/.bps/.ups/.ppf/.aps).",
             )
             return
         default_dest = default_patched_path(rom_p)
@@ -1363,7 +1382,7 @@ class GGROMPatcherApp(_BaseTk):
             return
         default_patch = Path(mod_p).with_suffix(".bps")
         dest = filedialog.asksaveasfilename(
-            title="Save Created Patch As (.ips / .bps / .ups)",
+            title="Save Created Patch As (.ips / .bps / .ups / .ppf / .aps)",
             initialdir=str(default_patch.parent),
             initialfile=default_patch.name,
             defaultextension=".bps",
@@ -1411,7 +1430,7 @@ class GGROMPatcherApp(_BaseTk):
             p = str(grouped["patches"][0])
             self.ips_apply_patch_var.set(p)
             self.batch_patch_file_var.set(p)
-            self.batch_source_mode_var.set("Apply Patch File (.ips/.bps/.ups)")
+            self.batch_source_mode_var.set("Apply Patch File (.ips/.bps/.ups/.ppf/.aps)")
             self._log(f"Loaded dropped patch file: {Path(p).name}")
 
     def _refresh_batch_tree(self, results: dict[Path, Any] | None = None) -> None:
@@ -1473,7 +1492,9 @@ class GGROMPatcherApp(_BaseTk):
             use_patch = "patch file" in self.batch_source_mode_var.get().lower()
             patch_file = self.batch_patch_file_var.get().strip() if use_patch else None
             if use_patch and not patch_file:
-                messagebox.showwarning("Missing Patch File", "Select a .ips/.bps/.ups patch file.")
+                messagebox.showwarning(
+                    "Missing Patch File", "Select a .ips/.bps/.ups/.ppf/.aps patch file."
+                )
                 return
             in_place = self.batch_in_place_var.get()
             out_dir = None if in_place else (self.batch_out_dir_var.get().strip() or None)

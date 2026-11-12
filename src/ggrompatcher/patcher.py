@@ -31,6 +31,8 @@ KNOWN_ROM_EXTENSIONS = frozenset(
         ".gb",
         ".gbc",
         ".sgb",
+        ".gba",
+        ".agb",
         ".gg",
         ".sms",
         ".nes",
@@ -105,9 +107,13 @@ def inspect_rom(
 def _normalize_codes_input(
     codes: Sequence[str | CheatEntry | DecodedCode] | str,
     handler_decode: Any,
+    *,
+    pair_hex8: bool = False,
 ) -> list[DecodedCode]:
     if isinstance(codes, str):
-        items: list[str | CheatEntry | DecodedCode] = list(parse_code_tokens(codes))
+        items: list[str | CheatEntry | DecodedCode] = list(
+            parse_code_tokens(codes, pair_hex8=pair_hex8)
+        )
     else:
         items = list(codes)
 
@@ -116,10 +122,10 @@ def _normalize_codes_input(
         if isinstance(item, DecodedCode):
             decoded_list.append(item)
         elif isinstance(item, CheatEntry):
-            for tok in parse_code_tokens(item.code):
+            for tok in parse_code_tokens(item.code, pair_hex8=pair_hex8):
                 decoded_list.append(handler_decode(tok, description=item.description))
         else:
-            for tok in parse_code_tokens(item):
+            for tok in parse_code_tokens(item, pair_hex8=pair_hex8):
                 decoded_list.append(handler_decode(tok))
     return decoded_list
 
@@ -154,7 +160,28 @@ def plan_patches(
     def _decode_item(tok: str, description: str = "") -> DecodedCode:
         upper = tok.strip().upper()
         is_prefixed = upper.startswith(
-            ("PAR:", "ROCKY:", "GS:", "AR:", "PAR ", "ROCKY ", "GS ", "AR ")
+            (
+                "PAR:",
+                "PAR3:",
+                "ROCKY:",
+                "GS:",
+                "GSA:",
+                "GSA1:",
+                "GS1:",
+                "AR:",
+                "AR3:",
+                "CB:",
+                "CBA:",
+                "PAR ",
+                "PAR3 ",
+                "ROCKY ",
+                "GS ",
+                "GSA ",
+                "AR ",
+                "AR3 ",
+                "CB ",
+                "CBA ",
+            )
         )
         if (
             allow_raw_fallback
@@ -165,7 +192,9 @@ def plan_patches(
             return raw_handler.decode_code(tok, description=description)
         return handler.decode_code(tok, description=description)
 
-    decoded_codes = _normalize_codes_input(codes, _decode_item)
+    decoded_codes = _normalize_codes_input(
+        codes, _decode_item, pair_hex8=(resolved_sys == ConsoleSystem.GBA)
+    )
     plans: list[PlannedPatch] = []
 
     for idx, decoded in enumerate(decoded_codes):
@@ -551,6 +580,8 @@ def patch_rom_file(
     ips_output_path: str | Path | None = None,
     bps_output_path: str | Path | None = None,
     ups_output_path: str | Path | None = None,
+    ppf_output_path: str | Path | None = None,
+    aps_output_path: str | Path | None = None,
     system: ConsoleSystem | str | None = None,
     bank: int | None = None,
     bank_overrides: dict[int, int] | None = None,
@@ -562,7 +593,7 @@ def patch_rom_file(
     dry_run: bool = False,
     **options: Any,
 ) -> tuple[PatchResult, Path | None]:
-    """Read `input_path`, apply patches, and write the patched ROM (and optional IPS/BPS/UPS)."""
+    """Read `input_path`, apply patches, and write the patched ROM (and optional binary patches)."""
     src = Path(input_path)
     if not src.is_file():
         raise RomFormatError(f"ROM file not found: {src}")
@@ -603,6 +634,10 @@ def patch_rom_file(
         patch_exports.append(("bps", bps_output_path))
     if ups_output_path is not None:
         patch_exports.append(("ups", ups_output_path))
+    if ppf_output_path is not None:
+        patch_exports.append(("ppf", ppf_output_path))
+    if aps_output_path is not None:
+        patch_exports.append(("aps", aps_output_path))
 
     if patch_exports:
         base_for_patch = original_bytes

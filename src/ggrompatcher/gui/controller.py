@@ -7,7 +7,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ggrompatcher.cheatfiles import CheatEntry, export_cheat_file, load_cheat_file, parse_cheat_text
+from ggrompatcher.cheatfiles import (
+    CheatEntry,
+    export_cheat_file,
+    load_cheat_file,
+    parse_cheat_text,
+    parse_code_tokens,
+)
 from ggrompatcher.models import (
     BatchRomItemResult,
     ConsoleSystem,
@@ -17,7 +23,9 @@ from ggrompatcher.models import (
     MatchStatus,
     PatchResult,
     PlannedPatch,
+    RomDbMatch,
     RomFormatError,
+    RomHashes,
     RomInfo,
 )
 from ggrompatcher.patch_formats import apply_binary_patch, write_binary_patch_file
@@ -34,10 +42,11 @@ from ggrompatcher.patcher import (
     plan_patches,
     preview_patch_diff,
 )
+from ggrompatcher.romdb import RomDatabase, compute_rom_hashes
 from ggrompatcher.systems import detect_system
 
 _CHEAT_EXTENSIONS = frozenset({".txt", ".gg", ".cht"})
-_PATCH_EXTENSIONS = frozenset({".ips", ".bps", ".ups"})
+_PATCH_EXTENSIONS = frozenset({".ips", ".bps", ".ups", ".ppf", ".aps"})
 
 
 @dataclass
@@ -208,7 +217,12 @@ class GuiController:
             )
 
         try:
-            parsed = parse_cheat_text(stripped)
+            pair_hex8 = target_sys == ConsoleSystem.GBA
+            if pair_hex8:
+                parsed_tokens = parse_code_tokens(stripped, pair_hex8=True)
+                parsed = [CheatEntry(code=tok) for tok in parsed_tokens]
+            else:
+                parsed = parse_cheat_text(stripped)
             if not parsed:
                 return LiveDecodeView(valid=False, summary="Enter a Game Genie code to preview.")
 
@@ -217,7 +231,28 @@ class GuiController:
             for entry in parsed:
                 upper = entry.code.strip().upper()
                 is_prefixed = upper.startswith(
-                    ("PAR:", "ROCKY:", "GS:", "AR:", "PAR ", "ROCKY ", "GS ", "AR ")
+                    (
+                        "PAR:",
+                        "PAR3:",
+                        "ROCKY:",
+                        "GS:",
+                        "GSA:",
+                        "GSA1:",
+                        "GS1:",
+                        "AR:",
+                        "AR3:",
+                        "CB:",
+                        "CBA:",
+                        "PAR ",
+                        "PAR3 ",
+                        "ROCKY ",
+                        "GS ",
+                        "GSA ",
+                        "AR ",
+                        "AR3 ",
+                        "CB ",
+                        "CBA ",
+                    )
                 )
                 if (
                     not is_prefixed
@@ -512,6 +547,8 @@ class GuiController:
             ips_output_path=export_target if export_ext == ".ips" else None,
             bps_output_path=export_target if export_ext == ".bps" else None,
             ups_output_path=export_target if export_ext == ".ups" else None,
+            ppf_output_path=export_target if export_ext == ".ppf" else None,
+            aps_output_path=export_target if export_ext == ".aps" else None,
             system=self.active_system,
             offset_overrides=remapped_offsets,
             all_matches=self.all_matches,
@@ -717,6 +754,21 @@ class GuiController:
     def clear_batch_roms(self) -> None:
         self.batch_rom_paths.clear()
 
+    def compute_loaded_rom_hashes(self) -> RomHashes:
+        """Compute CRC32/MD5/SHA-1/SHA-256 (and headerless hashes) for the loaded ROM."""
+        if self.rom_bytes is None:
+            raise RomFormatError("No ROM is currently loaded.")
+        return compute_rom_hashes(self.rom_bytes, system=self.active_system)
+
+    def verify_loaded_rom_against_dat(
+        self, dat_path: str | Path
+    ) -> tuple[RomHashes, list[RomDbMatch]]:
+        """Verify the currently loaded ROM against a Logiqx/No-Intro XML DAT or JSON file."""
+        if self.rom_bytes is None:
+            raise RomFormatError("No ROM is currently loaded.")
+        db = RomDatabase.from_file(dat_path)
+        return db.verify_rom(self.rom_bytes, system=self.active_system)
+
     def run_batch_patch(
         self,
         *,
@@ -735,7 +787,8 @@ class GuiController:
             _, active_entries = self._active_indices_and_entries()
             if not active_entries:
                 raise GGPatcherError(
-                    "Add enabled codes to the patch queue or select a .ips/.bps/.ups patch file."
+                    "Add enabled codes to the patch queue or select a patch file "
+                    "(.ips/.bps/.ups/.ppf/.aps)."
                 )
             codes_arg = active_entries
 

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 import ggrompatcher.cli as cli_mod
 from ggrompatcher.cli import main
-from tests.conftest import make_gb_rom, make_nes_rom
+from tests.conftest import make_gb_rom, make_gba_rom, make_nes_rom
 
 
 def test_cli_decode_and_encode_json(capsys: object) -> None:
@@ -207,3 +208,94 @@ def test_cli_bps_ups_diff_export_cheats_and_batch_patch(tmp_path: Path, capsys: 
     assert all(item["success"] for item in bp_json)
     assert (batch_dir / "g1.gb").read_bytes()[0x14BC] == 0x00
     assert (batch_dir / "g2.gb").read_bytes()[0x14BC] == 0x00
+
+
+def test_cli_gba_ppf_aps_and_inspect_hashes_dat(tmp_path: Path, capsys: object) -> None:
+    gba = make_gba_rom(size=0x20000, title="METROID TEST", game_code="AMTE")
+    gba_path = tmp_path / "metroid.gba"
+    gba_path.write_bytes(bytes(gba))
+
+    sha1_hex = hashlib.sha1(gba).hexdigest()
+    dat_path = tmp_path / "gba.dat"
+    dat_path.write_text(
+        f'<datafile><game name="Metroid Test (USA)"><rom name="metroid.gba" size="{len(gba)}" '
+        f'sha1="{sha1_hex}"/></game></datafile>',
+        encoding="utf-8",
+    )
+
+    assert main(["inspect", str(gba_path), "--hashes", "--dat", str(dat_path), "--json"]) == 0
+    ins_json = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert ins_json["system"] == "gba"
+    assert ins_json["hashes"]["sha1"] == sha1_hex
+    assert ins_json["dat_matches"][0]["game_title"] == "Metroid Test (USA)"
+
+    # GBA decode / encode / patch with --ppf-out and --aps-out
+    assert main(["encode", "-s", "gba", "--format", "gsa", "-a", "0x1000", "-v", "0x1234"]) == 0
+    assert capsys.readouterr().out.strip() == "GSA:60000800 00001234"  # type: ignore[attr-defined]
+
+    out_gba = tmp_path / "metroid.patched.gba"
+    ppf_p = tmp_path / "metroid.ppf"
+    aps_p = tmp_path / "metroid.aps"
+    rc = main(
+        [
+            "patch",
+            str(gba_path),
+            "-c",
+            "60000800 00001234",
+            "-o",
+            str(out_gba),
+            "--ppf-out",
+            str(ppf_p),
+            "--aps-out",
+            str(aps_p),
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()  # type: ignore[attr-defined]
+    assert out_gba.read_bytes()[0x1000:0x1002] == b"\x34\x12"
+
+    # ppf-create --undo / ppf-apply / ppf-apply --undo + aps-create --variant gba / aps-apply
+    ppf_undo = tmp_path / "undo.ppf"
+    restored_from_ppf = tmp_path / "restored.gba"
+    applied_ppf = tmp_path / "applied.gba"
+    assert (
+        main(
+            [
+                "ppf-create",
+                str(gba_path),
+                str(out_gba),
+                "-o",
+                str(ppf_undo),
+                "--version",
+                "3",
+                "--undo",
+            ]
+        )
+        == 0
+    )
+    assert main(["ppf-apply", str(gba_path), str(ppf_undo), "-o", str(applied_ppf)]) == 0
+    assert applied_ppf.read_bytes() == out_gba.read_bytes()
+    assert (
+        main(["ppf-apply", str(applied_ppf), str(ppf_undo), "--undo", "-o", str(restored_from_ppf)])
+        == 0
+    )
+    assert restored_from_ppf.read_bytes() == gba_path.read_bytes()
+
+    aps_gba = tmp_path / "gba_block.aps"
+    applied_aps = tmp_path / "applied_aps.gba"
+    assert (
+        main(
+            [
+                "aps-create",
+                str(gba_path),
+                str(out_gba),
+                "-o",
+                str(aps_gba),
+                "--variant",
+                "gba",
+            ]
+        )
+        == 0
+    )
+    assert main(["aps-apply", str(gba_path), str(aps_gba), "-o", str(applied_aps)]) == 0
+    assert applied_aps.read_bytes() == out_gba.read_bytes()

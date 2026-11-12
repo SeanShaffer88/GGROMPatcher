@@ -6,8 +6,31 @@ import pytest
 
 from ggrompatcher.systems.gameboy import NINTENDO_LOGO, GameBoyHandler
 from ggrompatcher.systems.gamegear import GameGearHandler, MasterSystemHandler
+from ggrompatcher.systems.gba import GBA_NINTENDO_LOGO, GbaHandler
 from ggrompatcher.systems.genesis import GenesisHandler, interleave_smd
 from ggrompatcher.systems.snes import SnesHandler
+
+
+def make_gba_rom(
+    *,
+    size: int = 0x20000,
+    title: str = "GOLDEN TEST",
+    game_code: str = "AGFE",
+    maker_code: str = "01",
+    version: int = 0,
+    fix_chk: bool = True,
+) -> bytearray:
+    rom = bytearray(max(size, 0xC0))
+    rom[0x00:0x04] = b"\x2e\x00\x00\xea"  # ARM B entry branch
+    rom[0x04:0xA0] = GBA_NINTENDO_LOGO
+    rom[0xA0:0xAC] = title.encode("ascii")[:12].ljust(12, b"\x00")
+    rom[0xAC:0xB0] = game_code.encode("ascii")[:4].ljust(4, b"\x00")
+    rom[0xB0:0xB2] = maker_code.encode("ascii")[:2].ljust(2, b"0")
+    rom[0xB2] = 0x96
+    rom[0xBC] = version & 0xFF
+    if fix_chk:
+        GbaHandler().fix_checksums(rom)
+    return rom
 
 
 def make_gb_rom(

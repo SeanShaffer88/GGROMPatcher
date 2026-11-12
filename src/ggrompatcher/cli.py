@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ggrompatcher.aps import create_aps
 from ggrompatcher.cheatfiles import (
     CheatEntry,
     export_cheat_file,
@@ -38,6 +39,9 @@ from ggrompatcher.patcher import (
     patch_rom_file,
     preview_patch_diff,
 )
+from ggrompatcher.ppf import create_ppf
+from ggrompatcher.romdb import RomDatabase, compute_rom_hashes
+from ggrompatcher.systems import detect_system
 
 
 def parse_int_auto(text: str) -> int:
@@ -131,6 +135,18 @@ def _print_rom_info(info: RomInfo) -> None:
         print("Checksums    : N/A (not used by this system)")
 
 
+def _is_gba_target(
+    system_arg: str | None, rom_bytes: bytes | None = None, filename: str | None = None
+) -> bool:
+    if system_arg:
+        return ConsoleSystem.from_str(system_arg) == ConsoleSystem.GBA
+    if rom_bytes is not None:
+        return detect_system(rom_bytes, filename=filename)[0] == ConsoleSystem.GBA
+    if filename:
+        return Path(filename).suffix.lower() in {".gba", ".agb"}
+    return False
+
+
 def _cmd_decode(args: argparse.Namespace) -> int:
     rom_bytes: bytes | None = None
     filename: str | None = None
@@ -141,9 +157,10 @@ def _cmd_decode(args: argparse.Namespace) -> int:
         rom_bytes = rom_path.read_bytes()
         filename = rom_path.name
 
+    pair_hex8 = _is_gba_target(args.system, rom_bytes, filename)
     tokens: list[str] = []
     for raw in args.codes:
-        tokens.extend(parse_code_tokens(raw))
+        tokens.extend(parse_code_tokens(raw, pair_hex8=pair_hex8))
 
     decoded_items = [
         decode_code(tok, system=args.system, rom=rom_bytes, filename=filename) for tok in tokens
@@ -224,23 +241,88 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     rom_path = Path(args.rom)
     if not rom_path.is_file():
         raise GGPatcherError(f"ROM file not found: {rom_path}")
+    raw_bytes = rom_path.read_bytes()
     info = inspect_rom(
-        rom_path.read_bytes(),
+        raw_bytes,
         system=args.system,
         filename=rom_path.name,
         snes_map=args.snes_map,
     )
+
+    hashes = None
+    dat_matches = []
+    if getattr(args, "hashes", False) or getattr(args, "dat", None):
+        hashes = compute_rom_hashes(raw_bytes, system=info.system)
+    if getattr(args, "dat", None):
+        db = RomDatabase.from_file(args.dat)
+        assert hashes is not None
+        dat_matches = db.lookup_hashes(hashes)
+
     if args.json:
-        print(json.dumps(_rom_info_to_dict(info), indent=2))
+        payload = _rom_info_to_dict(info)
+        if hashes is not None:
+            payload["hashes"] = {
+                "size": hashes.size,
+                "crc32": hashes.crc32,
+                "md5": hashes.md5,
+                "sha1": hashes.sha1,
+                "sha256": hashes.sha256,
+                "header_bytes": hashes.header_bytes,
+                "headerless_size": hashes.headerless_size,
+                "headerless_crc32": hashes.headerless_crc32,
+                "headerless_md5": hashes.headerless_md5,
+                "headerless_sha1": hashes.headerless_sha1,
+            }
+        if getattr(args, "dat", None):
+            payload["dat_matches"] = [
+                {
+                    "name": m.entry.name,
+                    "game_title": m.entry.game_title,
+                    "system": m.entry.system,
+                    "region": m.entry.region,
+                    "matched_by": m.matched_by,
+                    "via_headerless": m.via_headerless,
+                }
+                for m in dat_matches
+            ]
+        print(json.dumps(payload, indent=2))
     else:
         _print_rom_info(info)
+        if hashes is not None:
+            print("Hashes       :")
+            print(f"  - CRC32   : {hashes.crc32}")
+            print(f"  - MD5     : {hashes.md5}")
+            print(f"  - SHA-1   : {hashes.sha1}")
+            print(f"  - SHA-256 : {hashes.sha256}")
+            if hashes.header_bytes > 0 and hashes.headerless_crc32:
+                print(
+                    f"  - Headerless ({hashes.header_bytes}B stripped, "
+                    f"{hashes.headerless_size:,} bytes): "
+                    f"CRC32={hashes.headerless_crc32}, SHA-1={hashes.headerless_sha1}"
+                )
+        if getattr(args, "dat", None):
+            if dat_matches:
+                print("DAT Matches  :")
+                for m in dat_matches:
+                    hl = " [headerless]" if m.via_headerless else ""
+                    reg = f" [{m.entry.region}]" if m.entry.region else ""
+                    print(f"  - {m.entry.game_title}{reg} ({m.matched_by}{hl})")
+            else:
+                print("DAT Matches  : None found")
     return 0
 
 
 def _cmd_patch(args: argparse.Namespace) -> int:
+    rom_path = Path(args.rom)
+    if not rom_path.is_file():
+        raise GGPatcherError(f"ROM file not found: {rom_path}")
+
+    raw_rom = rom_path.read_bytes()
+    pair_hex8 = _is_gba_target(args.system, raw_rom, rom_path.name)
+
     entries: list[str | CheatEntry] = []
     for raw in args.code or []:
-        for tok in parse_code_tokens(raw):
+        for tok in parse_code_tokens(raw, pair_hex8=pair_hex8):
             entries.append(tok)
     for cheat_path in args.cheat_file or []:
         p = Path(cheat_path)
@@ -256,11 +338,6 @@ def _cmd_patch(args: argparse.Namespace) -> int:
 
     bank = parse_int_auto(args.bank) if args.bank is not None else None
 
-    # Validate first if not --skip-invalid and not --dry-run before writing files.
-    rom_path = Path(args.rom)
-    if not rom_path.is_file():
-        raise GGPatcherError(f"ROM file not found: {rom_path}")
-
     strict = not args.skip_invalid and not args.dry_run
     result, out_path = patch_rom_file(
         rom_path,
@@ -271,6 +348,8 @@ def _cmd_patch(args: argparse.Namespace) -> int:
         ips_output_path=args.ips_out,
         bps_output_path=args.bps_out,
         ups_output_path=args.ups_out,
+        ppf_output_path=getattr(args, "ppf_out", None),
+        aps_output_path=getattr(args, "aps_out", None),
         system=args.system,
         bank=bank,
         all_matches=args.all_matches,
@@ -291,7 +370,7 @@ def _cmd_patch(args: argparse.Namespace) -> int:
     diff_preview: DiffPreview | None = None
     if args.preview_diff:
         _, diff_preview = preview_patch_diff(
-            rom_path.read_bytes(),
+            raw_rom,
             entries,
             system=args.system,
             filename=rom_path.name,
@@ -344,6 +423,10 @@ def _cmd_patch(args: argparse.Namespace) -> int:
                 print(f"BPS patch exported -> {args.bps_out}")
             if args.ups_out:
                 print(f"UPS patch exported -> {args.ups_out}")
+            if getattr(args, "ppf_out", None):
+                print(f"PPF patch exported -> {args.ppf_out}")
+            if getattr(args, "aps_out", None):
+                print(f"APS patch exported -> {args.aps_out}")
             if args.export_cheats:
                 print(f"Cheat sheet exported -> {args.export_cheats}")
         if diff_preview is not None:
@@ -411,14 +494,42 @@ def _cmd_binary_patch_create(args: argparse.Namespace, fmt: str) -> int:
     if not mod_path.is_file():
         raise GGPatcherError(f"Modified ROM not found: {mod_path}")
 
-    metadata = getattr(args, "metadata", "") or ""
-    out_path = write_binary_patch_file(
-        args.output,
-        orig_path.read_bytes(),
-        mod_path.read_bytes(),
-        fmt=fmt,
-        metadata=metadata,
-    )
+    orig_bytes = orig_path.read_bytes()
+    mod_bytes = mod_path.read_bytes()
+
+    if fmt == "ppf":
+        payload = create_ppf(
+            orig_bytes,
+            mod_bytes,
+            description=getattr(args, "description", "Created with GGROMPatcher"),
+            version=getattr(args, "version", 3),
+            blockcheck=getattr(args, "blockcheck", False),
+            undo=getattr(args, "undo", False),
+            file_id_diz=getattr(args, "diz", ""),
+        )
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(payload)
+    elif fmt == "aps":
+        payload = create_aps(
+            orig_bytes,
+            mod_bytes,
+            description=getattr(args, "description", "Created with GGROMPatcher"),
+            variant=getattr(args, "variant", "auto"),
+            n64_v64=getattr(args, "v64", False),
+        )
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(payload)
+    else:
+        metadata = getattr(args, "metadata", "") or ""
+        out_path = write_binary_patch_file(
+            args.output,
+            orig_bytes,
+            mod_bytes,
+            fmt=fmt,
+            metadata=metadata,
+        )
     print(f"{fmt.upper()} patch written -> {out_path} ({out_path.stat().st_size:,} bytes)")
     return 0
 
@@ -435,12 +546,14 @@ def _cmd_binary_patch_apply(args: argparse.Namespace, fmt: str) -> int:
 
     dest = rom_path if args.in_place else Path(args.output or default_patched_path(rom_path))
     verify = not getattr(args, "ignore_checksums", False)
+    undo = bool(getattr(args, "undo", False))
     patched = apply_binary_patch(
         rom_path.read_bytes(),
         patch_path.read_bytes(),
         fmt=fmt,
         filename=patch_path.name,
         verify_checksums=verify,
+        undo=undo,
     )
 
     if args.fix_checksum:
@@ -464,9 +577,12 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     if not orig_path.is_file():
         raise GGPatcherError(f"Original ROM not found: {orig_path}")
 
+    orig_bytes = orig_path.read_bytes()
+    pair_hex8 = _is_gba_target(args.system, orig_bytes, orig_path.name)
+
     entries: list[str | CheatEntry] = []
     for raw in args.code or []:
-        entries.extend(parse_code_tokens(raw))
+        entries.extend(parse_code_tokens(raw, pair_hex8=pair_hex8))
     for cheat_path in args.cheat_file or []:
         p = Path(cheat_path)
         if not p.is_file():
@@ -478,14 +594,14 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         if not mod_path.is_file():
             raise GGPatcherError(f"Modified ROM not found: {mod_path}")
         preview = build_hex_diff_preview(
-            orig_path.read_bytes(),
+            orig_bytes,
             mod_path.read_bytes(),
             max_hunks=args.max_hunks,
         )
     elif entries and args.modified is None:
         bank = parse_int_auto(args.bank) if args.bank is not None else None
         _, preview = preview_patch_diff(
-            orig_path.read_bytes(),
+            orig_bytes,
             entries,
             system=args.system,
             filename=orig_path.name,
@@ -534,9 +650,10 @@ def _cmd_batch_patch(args: argparse.Namespace) -> int:
     if not rom_files:
         raise GGPatcherError("No ROM files matched the provided input path(s).")
 
+    pair_hex8 = _is_gba_target(args.system, filename=str(rom_files[0]) if rom_files else None)
     entries: list[str | CheatEntry] = []
     for raw in args.code or []:
-        entries.extend(parse_code_tokens(raw))
+        entries.extend(parse_code_tokens(raw, pair_hex8=pair_hex8))
     for cheat_path in args.cheat_file or []:
         p = Path(cheat_path)
         if not p.is_file():
@@ -614,7 +731,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ggrompatcher",
         description=(
-            "GGROMPatcher — Apply Game Genie patches to GB/GBC, Game Gear, Master System, "
+            "GGROMPatcher — Apply Game Genie, PAR, and GameShark patches and "
+            "IPS/BPS/UPS/PPF/APS binary patches across GB/GBC, GBA, Game Gear, Master System, "
             "NES, SNES, and Genesis/Mega Drive ROMs."
         ),
     )
@@ -626,10 +744,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_gui.set_defaults(func=_cmd_gui)
 
     # decode
-    p_dec = sub.add_parser("decode", help="Decode one or more Game Genie codes.")
-    p_dec.add_argument("codes", nargs="+", metavar="CODE", help="Game Genie code(s).")
+    p_dec = sub.add_parser("decode", help="Decode one or more Game Genie / PAR / GSA codes.")
+    p_dec.add_argument("codes", nargs="+", metavar="CODE", help="Game Genie / PAR / GSA code(s).")
     p_dec.add_argument(
-        "-s", "--system", help="Console system (gb, gg, sms, nes, snes, genesis, raw)."
+        "-s", "--system", help="Console system (gb, gba, gg, sms, nes, snes, genesis, raw)."
     )
     p_dec.add_argument("--rom", help="Optional ROM used to auto-detect system.")
     p_dec.add_argument("--json", action="store_true", help="Output JSON.")
@@ -644,14 +762,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_enc.add_argument(
         "--format",
         default="gg",
-        choices=["gg", "par", "rocky"],
-        help="Code format: 'gg' (Game Genie) or 'par'/'rocky' (SNES/Genesis/NES PAR).",
+        choices=["gg", "par", "rocky", "gsa", "gsa1", "par3"],
+        help="Code format: 'gg', 'par'/'rocky', or GBA 'gsa'/'gsa1'/'par3'.",
     )
     p_enc.add_argument("--json", action="store_true", help="Output JSON.")
     p_enc.set_defaults(func=_cmd_encode)
 
     # inspect
-    p_ins = sub.add_parser("inspect", help="Inspect ROM header metadata and verify checksums.")
+    p_ins = sub.add_parser(
+        "inspect", help="Inspect ROM header metadata, checksums, hashes, and DAT matches."
+    )
     p_ins.add_argument("rom", help="Path to ROM file.")
     p_ins.add_argument("-s", "--system", help="Override auto-detected console system.")
     p_ins.add_argument(
@@ -659,6 +779,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "lorom", "hirom", "exhirom", "exlorom"],
         help="SNES ROM memory map override.",
+    )
+    p_ins.add_argument(
+        "--hashes",
+        action="store_true",
+        help="Compute CRC32, MD5, SHA-1, and SHA-256 (plus headerless hashes).",
+    )
+    p_ins.add_argument(
+        "--dat",
+        help="Verify ROM hashes against a Logiqx/No-Intro XML .dat or JSON ROM database.",
     )
     p_ins.add_argument("--json", action="store_true", help="Output JSON.")
     p_ins.set_defaults(func=_cmd_inspect)
@@ -727,6 +856,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pat.add_argument("--ips-out", help="Also export an .ips patch file.")
     p_pat.add_argument("--bps-out", help="Also export a .bps patch file.")
     p_pat.add_argument("--ups-out", help="Also export a .ups patch file.")
+    p_pat.add_argument("--ppf-out", help="Also export a .ppf patch file.")
+    p_pat.add_argument("--aps-out", help="Also export an .aps patch file.")
     p_pat.add_argument(
         "--preview-diff",
         action="store_true",
@@ -755,8 +886,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_chk.add_argument("--json", action="store_true", help="Output JSON.")
     p_chk.set_defaults(func=_cmd_fix_checksum)
 
-    # ips-create / bps-create / ups-create
-    for fmt_name in ("ips", "bps", "ups"):
+    # ips-create / bps-create / ups-create / ppf-create / aps-create
+    for fmt_name in ("ips", "bps", "ups", "ppf", "aps"):
         p_pc = sub.add_parser(
             f"{fmt_name}-create",
             help=f"Create a {fmt_name.upper()} patch from original & modified ROMs.",
@@ -766,6 +897,35 @@ def build_parser() -> argparse.ArgumentParser:
         p_pc.add_argument("-o", "--output", required=True, help=f"Output .{fmt_name} file path.")
         if fmt_name == "bps":
             p_pc.add_argument("--metadata", default="", help="Optional BPS UTF-8 metadata.")
+        elif fmt_name == "ppf":
+            p_pc.add_argument(
+                "--version", type=int, default=3, choices=[1, 2, 3], help="PPF version (1, 2, 3)."
+            )
+            p_pc.add_argument(
+                "--description",
+                default="Created with GGROMPatcher",
+                help="50-char PPF description.",
+            )
+            p_pc.add_argument(
+                "--blockcheck", action="store_true", help="Embed 1024-byte PPF blockcheck."
+            )
+            p_pc.add_argument(
+                "--undo", action="store_true", help="Embed PPF 3.0 undo data for unpatching."
+            )
+            p_pc.add_argument("--diz", default="", help="Optional PPF 3.0 FILE_ID.DIZ note.")
+        elif fmt_name == "aps":
+            p_pc.add_argument(
+                "--description",
+                default="Created with GGROMPatcher",
+                help="50-char APS description.",
+            )
+            p_pc.add_argument(
+                "--variant",
+                default="auto",
+                choices=["auto", "n64", "simple", "gba"],
+                help="APS variant: auto (N64 if detected else simple), n64, simple, or gba (APS1).",
+            )
+            p_pc.add_argument("--v64", action="store_true", help="Mark N64 APS origin as .v64.")
         p_pc.set_defaults(func=_make_patch_create_cmd(fmt_name))
 
         p_pa = sub.add_parser(
@@ -777,11 +937,17 @@ def build_parser() -> argparse.ArgumentParser:
         p_pa.add_argument("-o", "--output", help="Output patched ROM file.")
         p_pa.add_argument("-i", "--in-place", action="store_true", help="Overwrite ROM in place.")
         p_pa.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
-        if fmt_name in {"bps", "ups"}:
+        if fmt_name in {"bps", "ups", "ppf", "aps"}:
             p_pa.add_argument(
                 "--ignore-checksums",
                 action="store_true",
-                help=f"Skip {fmt_name.upper()} CRC32/size verification.",
+                help=f"Skip {fmt_name.upper()} source/target validation.",
+            )
+        if fmt_name == "ppf":
+            p_pa.add_argument(
+                "--undo",
+                action="store_true",
+                help="Revert patch using embedded PPF 3.0 undo data.",
             )
         p_pa.add_argument(
             "--fix-checksum",
@@ -837,7 +1003,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_bp.add_argument("-c", "--code", action="append", help="Game Genie/PAR code(s).")
     p_bp.add_argument("-f", "--cheat-file", action="append", help="Input cheat file(s).")
     p_bp.add_argument("--enabled-only", action="store_true", help="Only import enabled cheats.")
-    p_bp.add_argument("--patch-file", help="Apply an .ips, .bps, or .ups patch to each ROM.")
+    p_bp.add_argument(
+        "--patch-file", help="Apply an .ips, .bps, .ups, .ppf, or .aps patch to each ROM."
+    )
     p_bp.add_argument("--out-dir", help="Directory for output ROMs.")
     p_bp.add_argument("-i", "--in-place", action="store_true", help="Patch ROMs in place.")
     p_bp.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
