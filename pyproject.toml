@@ -5,14 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ggrompatcher"
 version = "0.1.0"
-description = "Cross-platform Game Genie ROM patcher, encoder/decoder, checksum fixer, and IPS generator with Desktop GUI and CLI."
+description = "Cross-platform Game Genie/PAR/GSA ROM patcher, IPS/BPS/UPS/PPF/APS patch tool, checksum fixer, and ROM DAT verifier with Desktop GUI and CLI."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Sean Shaffer" },
 ]
-keywords = ["game-genie", "rom-patcher", "gameboy", "nes", "snes", "genesis", "gamegear", "ips"]
+keywords = [
+    "game-genie",
+    "rom-patcher",
+    "gameboy",
+    "gba",
+    "nes",
+    "snes",
+    "genesis",
+    "gamegear",
+    "ips",
+    "bps",
+    "ups",
+    "ppf",
+    "aps",
+    "nointro",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
