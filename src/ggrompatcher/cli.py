@@ -1,0 +1,574 @@
+"""Command-line interface for GGROMPatcher."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+from ggrompatcher.cheatfiles import CheatEntry, load_cheat_file, parse_code_tokens
+from ggrompatcher.ips import apply_ips, write_ips_file
+from ggrompatcher.models import (
+    ConsoleSystem,
+    GGPatcherError,
+    PatchResult,
+    RomInfo,
+)
+from ggrompatcher.patcher import (
+    decode_code,
+    default_patched_path,
+    encode_code,
+    fix_rom_checksums,
+    inspect_rom,
+    patch_rom_file,
+)
+
+
+def parse_int_auto(text: str) -> int:
+    """Parse an integer written as decimal, `0x...`, or `$...` hex."""
+    s = text.strip()
+    if s.startswith("$"):
+        return int(s[1:], 16)
+    if s.lower().startswith("0x"):
+        return int(s, 16)
+    # Default to hex if A-F characters appear, else allow 0x/hex in addr/value helpers.
+    if any(ch in "abcdefABCDEF" for ch in s):
+        return int(s, 16)
+    return int(s, 0)
+
+
+def parse_hex_int(text: str) -> int:
+    """Parse a hexadecimal value (accepting optional `0x` or `$` prefix)."""
+    s = text.strip()
+    if s.startswith("$"):
+        s = s[1:]
+    elif s.lower().startswith("0x"):
+        s = s[2:]
+    return int(s, 16)
+
+
+def _rom_info_to_dict(info: RomInfo) -> dict[str, Any]:
+    return {
+        "system": info.system.value,
+        "system_name": info.system.display_name,
+        "file_size": info.file_size,
+        "title": info.title,
+        "header_format": info.header_format,
+        "checksums": [
+            {
+                "name": c.name,
+                "offset": f"0x{c.offset:06X}",
+                "stored": f"0x{c.stored:0{c.width * 2}X}",
+                "computed": f"0x{c.computed:0{c.width * 2}X}",
+                "valid": c.valid,
+            }
+            for c in info.checksums
+        ],
+        "extra": info.extra,
+    }
+
+
+def _patch_result_to_dict(result: PatchResult, output_path: Path | None) -> dict[str, Any]:
+    return {
+        "output_path": str(output_path) if output_path else None,
+        "bytes_modified": result.bytes_modified,
+        "rom_before": _rom_info_to_dict(result.rom_info_before),
+        "rom_after": _rom_info_to_dict(result.rom_info_after),
+        "applied_count": len(result.applied_patches),
+        "skipped_count": len(result.skipped_patches),
+        "warnings": result.warnings,
+        "patches": [
+            {
+                "code": p.code.normalized_code,
+                "description": p.code.description,
+                "address": f"0x{p.code.address:06X}",
+                "value": p.code.value.hex().upper(),
+                "compare": p.code.compare.hex().upper() if p.code.compare else None,
+                "status": p.status.value,
+                "can_apply": p.can_apply,
+                "selected_offsets": [f"0x{off:06X}" for off in p.selected_offsets],
+                "message": p.message,
+            }
+            for p in result.planned_patches
+        ],
+    }
+
+
+def _print_rom_info(info: RomInfo) -> None:
+    print(f"System       : {info.system.display_name} ({info.system.value})")
+    print(f"Title        : {info.title}")
+    print(f"Format       : {info.header_format}")
+    print(f"Size         : {info.file_size:,} bytes (0x{info.file_size:X})")
+    for k, v in info.extra.items():
+        if v is not None and v != "":
+            print(f"  {k:<14}: {v}")
+    if info.checksums:
+        print("Checksums    :")
+        for c in info.checksums:
+            w = c.width * 2
+            status = "OK" if c.valid else "MISMATCH"
+            print(
+                f"  - {c.name} @ 0x{c.offset:06X}: "
+                f"stored=0x{c.stored:0{w}X}, computed=0x{c.computed:0{w}X} [{status}]"
+            )
+    else:
+        print("Checksums    : N/A (not used by this system)")
+
+
+def _cmd_decode(args: argparse.Namespace) -> int:
+    rom_bytes: bytes | None = None
+    filename: str | None = None
+    if args.rom:
+        rom_path = Path(args.rom)
+        if not rom_path.is_file():
+            raise GGPatcherError(f"ROM file not found: {rom_path}")
+        rom_bytes = rom_path.read_bytes()
+        filename = rom_path.name
+
+    tokens: list[str] = []
+    for raw in args.codes:
+        tokens.extend(parse_code_tokens(raw))
+
+    decoded_items = [
+        decode_code(tok, system=args.system, rom=rom_bytes, filename=filename) for tok in tokens
+    ]
+
+    if args.json:
+        payload = [
+            {
+                "code": d.normalized_code,
+                "system": d.system.value,
+                "address": f"0x{d.address:06X}",
+                "value": f"0x{d.value.hex().upper()}",
+                "compare": f"0x{d.compare.hex().upper()}" if d.compare else None,
+                "warnings": list(d.warnings),
+            }
+            for d in decoded_items
+        ]
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    for d in decoded_items:
+        cmp_part = f" | compare=0x{d.compare.hex().upper()}" if d.compare else ""
+        print(
+            f"{d.normalized_code:<14} [{d.system.value}] "
+            f"addr=0x{d.address:06X} | value=0x{d.value.hex().upper()}{cmp_part}"
+        )
+        for w in d.warnings:
+            print(f"  WARNING: {w}")
+    return 0
+
+
+def _cmd_encode(args: argparse.Namespace) -> int:
+    addr = parse_hex_int(args.addr)
+    val = parse_hex_int(args.value)
+    cmp_val = parse_hex_int(args.compare) if args.compare is not None else None
+    sys_type = ConsoleSystem.from_str(args.system)
+    code = encode_code(sys_type, addr, val, cmp_val)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "system": sys_type.value,
+                    "address": f"0x{addr:06X}",
+                    "value": f"0x{val:02X}",
+                    "compare": f"0x{cmp_val:02X}" if cmp_val is not None else None,
+                    "code": code,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(code)
+    return 0
+
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    rom_path = Path(args.rom)
+    if not rom_path.is_file():
+        raise GGPatcherError(f"ROM file not found: {rom_path}")
+    info = inspect_rom(
+        rom_path.read_bytes(),
+        system=args.system,
+        filename=rom_path.name,
+        snes_map=args.snes_map,
+    )
+    if args.json:
+        print(json.dumps(_rom_info_to_dict(info), indent=2))
+    else:
+        _print_rom_info(info)
+    return 0
+
+
+def _cmd_patch(args: argparse.Namespace) -> int:
+    entries: list[str | CheatEntry] = []
+    for raw in args.code or []:
+        for tok in parse_code_tokens(raw):
+            entries.append(tok)
+    for cheat_path in args.cheat_file or []:
+        p = Path(cheat_path)
+        if not p.is_file():
+            raise GGPatcherError(f"Cheat file not found: {p}")
+        entries.extend(load_cheat_file(p, enabled_only=args.enabled_only))
+
+    if not entries:
+        raise GGPatcherError("No Game Genie codes supplied. Provide --code and/or --cheat-file.")
+
+    if args.in_place and args.output:
+        raise GGPatcherError("Cannot specify both --in-place and --output.")
+
+    bank = parse_int_auto(args.bank) if args.bank is not None else None
+
+    # Validate first if not --skip-invalid and not --dry-run before writing files.
+    rom_path = Path(args.rom)
+    if not rom_path.is_file():
+        raise GGPatcherError(f"ROM file not found: {rom_path}")
+
+    strict = not args.skip_invalid and not args.dry_run
+    result, out_path = patch_rom_file(
+        rom_path,
+        entries,
+        output_path=args.output,
+        in_place=args.in_place,
+        backup=not args.no_backup,
+        ips_output_path=args.ips_out,
+        system=args.system,
+        bank=bank,
+        all_matches=args.all_matches,
+        force=args.force,
+        fix_checksum=not args.no_checksum,
+        strict=strict,
+        dry_run=args.dry_run,
+        snes_map=args.snes_map,
+        nes_bank_size=args.nes_bank_size,
+    )
+
+    if args.json:
+        print(json.dumps(_patch_result_to_dict(result, out_path), indent=2))
+    else:
+        print(
+            f"ROM: {rom_path.name} ({result.rom_info_before.system.display_name}, "
+            f"{result.rom_info_before.header_format})"
+        )
+        print("-" * 72)
+        for plan in result.planned_patches:
+            status_tag = plan.status.value.upper()
+            desc = f" ({plan.code.description})" if plan.code.description else ""
+            print(f"[{status_tag:<16}] {plan.code.normalized_code:<14}{desc} -> {plan.message}")
+        print("-" * 72)
+        if result.warnings:
+            for w in result.warnings:
+                print(f"WARNING: {w}")
+        if args.dry_run:
+            print(
+                f"Dry run complete: {len(result.applied_patches)} ready, "
+                f"{len(result.skipped_patches)} blocked/skipped."
+            )
+        else:
+            print(
+                f"Applied {len(result.applied_patches)} patch(es), "
+                f"{result.bytes_modified} byte(s) changed -> {out_path}"
+            )
+            if result.checksums_updated:
+                chk_summary = ", ".join(
+                    f"{c.name}=0x{c.computed:0{c.width * 2}X}" for c in result.checksums_updated
+                )
+                print(f"Checksums updated: {chk_summary}")
+            if args.ips_out:
+                print(f"IPS patch exported -> {args.ips_out}")
+
+    has_failures = any(not p.can_apply for p in result.planned_patches)
+    if args.dry_run and has_failures:
+        return 2
+    if args.skip_invalid and len(result.applied_patches) == 0:
+        return 2
+    return 0
+
+
+def _cmd_fix_checksum(args: argparse.Namespace) -> int:
+    rom_path = Path(args.rom)
+    if not rom_path.is_file():
+        raise GGPatcherError(f"ROM file not found: {rom_path}")
+    if args.in_place and args.output:
+        raise GGPatcherError("Cannot specify both --in-place and --output.")
+
+    dest = rom_path if args.in_place else Path(args.output or default_patched_path(rom_path))
+    raw = rom_path.read_bytes()
+    before, after, fixed = fix_rom_checksums(
+        raw,
+        system=args.system,
+        filename=rom_path.name,
+        output_filename=dest.name,
+        snes_map=args.snes_map,
+    )
+
+    if not after.checksums:
+        raise GGPatcherError(
+            f"{before.system.display_name} does not use an embedded header checksum "
+            "(or header missing)."
+        )
+
+    if args.in_place and not args.no_backup:
+        shutil.copy2(rom_path, rom_path.with_name(f"{rom_path.name}.bak"))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(fixed)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "output_path": str(dest),
+                    "before": _rom_info_to_dict(before),
+                    "after": _rom_info_to_dict(after),
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"Fixed checksums for {rom_path.name} -> {dest}")
+        _print_rom_info(after)
+    return 0
+
+
+def _cmd_ips_create(args: argparse.Namespace) -> int:
+    orig_path = Path(args.original)
+    mod_path = Path(args.modified)
+    if not orig_path.is_file():
+        raise GGPatcherError(f"Original ROM not found: {orig_path}")
+    if not mod_path.is_file():
+        raise GGPatcherError(f"Modified ROM not found: {mod_path}")
+
+    out_path = write_ips_file(args.output, orig_path.read_bytes(), mod_path.read_bytes())
+    print(f"IPS patch written -> {out_path} ({out_path.stat().st_size:,} bytes)")
+    return 0
+
+
+def _cmd_ips_apply(args: argparse.Namespace) -> int:
+    rom_path = Path(args.rom)
+    ips_path = Path(args.ips)
+    if not rom_path.is_file():
+        raise GGPatcherError(f"ROM file not found: {rom_path}")
+    if not ips_path.is_file():
+        raise GGPatcherError(f"IPS patch not found: {ips_path}")
+    if args.in_place and args.output:
+        raise GGPatcherError("Cannot specify both --in-place and --output.")
+
+    dest = rom_path if args.in_place else Path(args.output or default_patched_path(rom_path))
+    patched = apply_ips(rom_path.read_bytes(), ips_path.read_bytes())
+
+    if args.fix_checksum:
+        _, _, patched = fix_rom_checksums(
+            patched,
+            system=args.system,
+            filename=rom_path.name,
+            output_filename=dest.name,
+        )
+
+    if args.in_place and not args.no_backup:
+        shutil.copy2(rom_path, rom_path.with_name(f"{rom_path.name}.bak"))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(patched)
+    print(f"Applied {ips_path.name} -> {dest} ({len(patched):,} bytes)")
+    return 0
+
+
+def _cmd_gui(args: argparse.Namespace) -> int:
+    from ggrompatcher.gui import launch_gui
+
+    return launch_gui(initial_rom=args.rom)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ggrompatcher",
+        description=(
+            "GGROMPatcher — Apply Game Genie patches to GB/GBC, Game Gear, Master System, "
+            "NES, SNES, and Genesis/Mega Drive ROMs."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    # gui
+    p_gui = sub.add_parser("gui", help="Launch the desktop graphical interface.")
+    p_gui.add_argument("rom", nargs="?", help="Optional ROM file to open on startup.")
+    p_gui.set_defaults(func=_cmd_gui)
+
+    # decode
+    p_dec = sub.add_parser("decode", help="Decode one or more Game Genie codes.")
+    p_dec.add_argument("codes", nargs="+", metavar="CODE", help="Game Genie code(s).")
+    p_dec.add_argument(
+        "-s", "--system", help="Console system (gb, gg, sms, nes, snes, genesis, raw)."
+    )
+    p_dec.add_argument("--rom", help="Optional ROM used to auto-detect system.")
+    p_dec.add_argument("--json", action="store_true", help="Output JSON.")
+    p_dec.set_defaults(func=_cmd_decode)
+
+    # encode
+    p_enc = sub.add_parser("encode", help="Encode an address and value into a Game Genie code.")
+    p_enc.add_argument("-s", "--system", required=True, help="Console system.")
+    p_enc.add_argument("-a", "--addr", required=True, help="Target address in hex (e.g. 0x14BC).")
+    p_enc.add_argument("-v", "--value", required=True, help="Replacement value in hex (e.g. 0x00).")
+    p_enc.add_argument("-c", "--compare", help="Optional compare byte in hex (GB/GG/SMS/NES).")
+    p_enc.add_argument("--json", action="store_true", help="Output JSON.")
+    p_enc.set_defaults(func=_cmd_encode)
+
+    # inspect
+    p_ins = sub.add_parser("inspect", help="Inspect ROM header metadata and verify checksums.")
+    p_ins.add_argument("rom", help="Path to ROM file.")
+    p_ins.add_argument("-s", "--system", help="Override auto-detected console system.")
+    p_ins.add_argument(
+        "--snes-map",
+        default="auto",
+        choices=["auto", "lorom", "hirom", "exhirom", "exlorom"],
+        help="SNES ROM memory map override.",
+    )
+    p_ins.add_argument("--json", action="store_true", help="Output JSON.")
+    p_ins.set_defaults(func=_cmd_inspect)
+
+    # patch
+    p_pat = sub.add_parser("patch", help="Apply Game Genie codes or cheat files to a ROM.")
+    p_pat.add_argument("rom", help="Input ROM file path.")
+    p_pat.add_argument("-c", "--code", action="append", help="Game Genie code (or '+' chain).")
+    p_pat.add_argument(
+        "-f", "--cheat-file", action="append", help="Path to .txt, .gg, or .cht file."
+    )
+    p_pat.add_argument(
+        "--enabled-only",
+        action="store_true",
+        help="Only import cheats marked enabled in RetroArch .cht files.",
+    )
+    p_pat.add_argument("-o", "--output", help="Output patched ROM path.")
+    p_pat.add_argument(
+        "-i",
+        "--in-place",
+        action="store_true",
+        help="Overwrite the input ROM in place (creates .bak backup by default).",
+    )
+    p_pat.add_argument("--no-backup", action="store_true", help="Do not create .bak when using -i.")
+    p_pat.add_argument("-s", "--system", help="Override auto-detected console system.")
+    p_pat.add_argument(
+        "--snes-map",
+        default="auto",
+        choices=["auto", "lorom", "hirom", "exhirom", "exlorom"],
+        help="SNES ROM memory map override.",
+    )
+    p_pat.add_argument(
+        "--nes-bank-size",
+        default="auto",
+        choices=["auto", "8k", "16k", "32k"],
+        help="NES PRG bank granularity override.",
+    )
+    p_pat.add_argument(
+        "--bank", help="Explicit bank number (decimal or 0x hex) for ambiguous codes."
+    )
+    p_pat.add_argument(
+        "--all-matches",
+        action="store_true",
+        help="Apply to all matching/candidate banks when multiple banks match.",
+    )
+    p_pat.add_argument(
+        "--force",
+        action="store_true",
+        help="Force patching even if compare byte does not match.",
+    )
+    p_pat.add_argument(
+        "--no-checksum",
+        action="store_true",
+        help="Skip automatic ROM checksum recalculation.",
+    )
+    p_pat.add_argument(
+        "--skip-invalid",
+        action="store_true",
+        help="Write patched ROM even if some codes fail validation or are ambiguous.",
+    )
+    p_pat.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and validate codes without writing output files.",
+    )
+    p_pat.add_argument("--ips-out", help="Also export an .ips patch file.")
+    p_pat.add_argument("--json", action="store_true", help="Output JSON.")
+    p_pat.set_defaults(func=_cmd_patch)
+
+    # fix-checksum
+    p_chk = sub.add_parser("fix-checksum", help="Recalculate and repair ROM header checksums.")
+    p_chk.add_argument("rom", help="Input ROM file path.")
+    p_chk.add_argument("-o", "--output", help="Output ROM file path.")
+    p_chk.add_argument("-i", "--in-place", action="store_true", help="Modify ROM in place.")
+    p_chk.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
+    p_chk.add_argument("-s", "--system", help="Override auto-detected console system.")
+    p_chk.add_argument(
+        "--snes-map",
+        default="auto",
+        choices=["auto", "lorom", "hirom", "exhirom", "exlorom"],
+        help="SNES ROM memory map override.",
+    )
+    p_chk.add_argument("--json", action="store_true", help="Output JSON.")
+    p_chk.set_defaults(func=_cmd_fix_checksum)
+
+    # ips-create
+    p_ic = sub.add_parser("ips-create", help="Create an IPS patch from original & modified ROMs.")
+    p_ic.add_argument("original", help="Original unpatched ROM file.")
+    p_ic.add_argument("modified", help="Modified ROM file.")
+    p_ic.add_argument("-o", "--output", required=True, help="Output .ips file path.")
+    p_ic.set_defaults(func=_cmd_ips_create)
+
+    # ips-apply
+    p_ia = sub.add_parser("ips-apply", help="Apply an IPS patch to a ROM.")
+    p_ia.add_argument("rom", help="Original ROM file.")
+    p_ia.add_argument("ips", help="IPS patch file.")
+    p_ia.add_argument("-o", "--output", help="Output patched ROM file.")
+    p_ia.add_argument("-i", "--in-place", action="store_true", help="Overwrite ROM in place.")
+    p_ia.add_argument("--no-backup", action="store_true", help="Disable .bak backup with -i.")
+    p_ia.add_argument(
+        "--fix-checksum",
+        action="store_true",
+        help="Recalculate console checksum after applying IPS.",
+    )
+    p_ia.add_argument("-s", "--system", help="Console system for --fix-checksum.")
+    p_ia.set_defaults(func=_cmd_ips_apply)
+
+    return parser
+
+
+def _can_launch_default_gui() -> bool:
+    if sys.platform in {"win32", "darwin"}:
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    arg_list = sys.argv[1:] if argv is None else argv
+
+    if not arg_list:
+        if _can_launch_default_gui():
+            try:
+                from ggrompatcher.gui import is_tk_available, launch_gui
+
+                if is_tk_available():
+                    return launch_gui()
+            except Exception:
+                pass
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args(arg_list)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 0
+
+    try:
+        return int(args.func(args))
+    except (GGPatcherError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
