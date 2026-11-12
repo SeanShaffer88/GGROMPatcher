@@ -13,6 +13,7 @@ jobs:
   python-packages:
     name: Build Wheel, Source Dist & Zipapp
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,6 +29,7 @@ jobs:
           python -m build
           python scripts/build_zipapp.py -o dist/ggrompatcher.pyz
           python dist/ggrompatcher.pyz --help
+          python dist/ggrompatcher.pyz decode -s gb 004-BCE-E66 --json
       - uses: actions/upload-artifact@v4
         with:
           name: python-dist
@@ -36,6 +38,7 @@ jobs:
   standalone-binaries:
     name: Build Binary (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -60,12 +63,13 @@ jobs:
           pip install -e . pyinstaller
       - name: Build standalone CLI+GUI binary
         run: |
-          pyinstaller --onefile --name ggrompatcher-${{ matrix.target }} --paths src src/ggrompatcher/__main__.py
+          pyinstaller --noconfirm --onefile --name ggrompatcher-${{ matrix.target }} --paths src --collect-submodules ggrompatcher src/ggrompatcher/__main__.py
       - name: Smoke test built binary
         shell: bash
         run: |
           ./dist/ggrompatcher-${{ matrix.target }}${{ matrix.ext }} --help
           ./dist/ggrompatcher-${{ matrix.target }}${{ matrix.ext }} decode -s gb 004-BCE-E66
+          ./dist/ggrompatcher-${{ matrix.target }}${{ matrix.ext }} decode -s gba "60000800 00001234"
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
@@ -76,11 +80,18 @@ jobs:
     needs: [python-packages, standalone-binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          sha256sum * > /tmp/SHA256SUMS.txt
+          mv /tmp/SHA256SUMS.txt SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
