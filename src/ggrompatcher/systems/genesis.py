@@ -152,7 +152,57 @@ class GenesisHandler(SystemHandler):
             )
         return rom
 
+    def _decode_par(self, raw_code: str, body: str, description: str) -> DecodedCode:
+        compact = body.strip().upper().replace(" ", "").replace("-", "")
+        if ":" in compact:
+            addr_hex, val_hex = compact.split(":", 1)
+        elif len(compact) in (8, 10) and all(ch in "0123456789ABCDEF" for ch in compact):
+            addr_hex, val_hex = compact[:6], compact[6:]
+        else:
+            raise CodeFormatError(
+                f"Invalid Genesis Pro Action Replay code '{raw_code}': "
+                "expected PAR:AAAAAA:DDDD or PAR:AAAAAA:DD."
+            )
+        if len(addr_hex) != 6 or len(val_hex) not in (2, 4):
+            raise CodeFormatError(
+                f"Invalid Genesis Pro Action Replay code '{raw_code}': "
+                "expected 24-bit hex address and 8-bit or 16-bit hex value."
+            )
+        try:
+            address = int(addr_hex, 16)
+            val_bytes = bytes.fromhex(val_hex)
+        except ValueError as exc:
+            raise CodeFormatError(
+                f"Invalid hex characters in Genesis PAR code '{raw_code}'."
+            ) from exc
+
+        if address >= 0xE00000:
+            raise CodeFormatError(
+                f"Genesis Pro Action Replay code '{raw_code}' targets 68000 RAM "
+                f"(0x{address:06X}), not cartridge ROM."
+            )
+        warnings: list[str] = []
+        if len(val_bytes) == 2 and address % 2 != 0:
+            warnings.append(
+                f"Address 0x{address:06X} is odd; 68000 word patches normally target even offsets."
+            )
+        return DecodedCode(
+            raw_code=raw_code.strip(),
+            normalized_code=f"PAR:{address:06X}:{val_bytes.hex().upper()}",
+            system=self.system,
+            address=address,
+            value=val_bytes,
+            compare=None,
+            description=description,
+            warnings=tuple(warnings),
+        )
+
     def decode_code(self, code: str, description: str = "") -> DecodedCode:
+        raw_upper = code.strip().upper()
+        for prefix in ("PAR:", "AR:", "PAR ", "AR "):
+            if raw_upper.startswith(prefix):
+                return self._decode_par(code, raw_upper[len(prefix) :], description)
+
         clean = clean_code_chars(code)
         if len(clean) != 8:
             raise CodeFormatError(
@@ -198,7 +248,14 @@ class GenesisHandler(SystemHandler):
             warnings=tuple(warnings),
         )
 
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
         if not 0 <= address <= 0xFFFFFF:
             raise CodeFormatError(
                 f"Address 0x{address:06X} out of 24-bit Genesis range (0x000000-0xFFFFFF)."
@@ -208,7 +265,15 @@ class GenesisHandler(SystemHandler):
                 f"Replacement value 0x{value:X} must be a 16-bit word (0x0000-0xFFFF)."
             )
         if compare is not None:
-            raise CodeFormatError("Genesis Game Genie codes do not support a compare value.")
+            raise CodeFormatError("Genesis Game Genie/PAR codes do not support a compare value.")
+
+        fmt = code_format.strip().lower()
+        if fmt in {"par", "ar"}:
+            return f"PAR:{address:06X}:{value:04X}"
+        if fmt != "gg":
+            raise CodeFormatError(
+                f"Unsupported Genesis code format '{code_format}'. Use 'gg' or 'par'."
+            )
 
         clear = ((address & 0xFFFFFF) << 16) | (value & 0xFFFF)
         v = (

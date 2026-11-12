@@ -95,3 +95,99 @@ def test_cli_no_args_headless_and_errors(capsys: object) -> None:
 
     # Missing file returns exit code 1 cleanly
     assert main(["inspect", "/nonexistent/rom.gb"]) == 1
+
+
+def test_cli_bps_ups_diff_export_cheats_and_batch_patch(tmp_path: Path, capsys: object) -> None:
+    rom1 = make_gb_rom(banks=2)
+    rom1[0x14BC] = 0x03
+    rom2 = make_gb_rom(banks=2)
+    rom2[0x14BC] = 0x03
+
+    r1_p = tmp_path / "g1.gb"
+    r2_p = tmp_path / "g2.gb"
+    r1_p.write_bytes(bytes(rom1))
+    r2_p.write_bytes(bytes(rom2))
+
+    # encode --format par
+    assert (
+        main(["encode", "-s", "nes", "--format", "par", "-a", "0x9123", "-v", "0xBD", "-c", "0xDE"])
+        == 0
+    )
+    assert capsys.readouterr().out.strip() == "15C93C0A"  # type: ignore[attr-defined]
+
+    # diff subcommand JSON + text
+    assert main(["diff", str(r1_p), "-c", "004-BCE-E66", "--json"]) == 0
+    diff_json = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert diff_json["bytes_changed"] >= 1
+    assert diff_json["hunks"]
+
+    # patch with --preview-diff --bps-out --ups-out --export-cheats
+    out_gb = tmp_path / "g1.patched.gb"
+    bps_p = tmp_path / "g1.bps"
+    ups_p = tmp_path / "g1.ups"
+    cht_p = tmp_path / "g1.cht"
+    rc = main(
+        [
+            "patch",
+            str(r1_p),
+            "-c",
+            "004-BCE-E66",
+            "-o",
+            str(out_gb),
+            "--bps-out",
+            str(bps_p),
+            "--ups-out",
+            str(ups_p),
+            "--preview-diff",
+            "--export-cheats",
+            str(cht_p),
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()  # type: ignore[attr-defined]
+    assert out_gb.is_file()
+    assert bps_p.is_file()
+    assert ups_p.is_file()
+    assert cht_p.is_file()
+
+    # bps-create / bps-apply / ups-create / ups-apply
+    bps2 = tmp_path / "manual.bps"
+    ups2 = tmp_path / "manual.ups"
+    app_bps = tmp_path / "applied_bps.gb"
+    app_ups = tmp_path / "applied_ups.gb"
+    rev_ups = tmp_path / "reversed_ups.gb"
+    assert main(["bps-create", str(r1_p), str(out_gb), "-o", str(bps2), "--metadata", "demo"]) == 0
+    assert main(["bps-apply", str(r1_p), str(bps2), "-o", str(app_bps)]) == 0
+    assert app_bps.read_bytes() == out_gb.read_bytes()
+    assert main(["ups-create", str(r1_p), str(out_gb), "-o", str(ups2)]) == 0
+    assert main(["ups-apply", str(r1_p), str(ups2), "-o", str(app_ups)]) == 0
+    assert app_ups.read_bytes() == out_gb.read_bytes()
+    assert main(["ups-apply", str(app_ups), str(ups2), "-o", str(rev_ups)]) == 0
+    assert rev_ups.read_bytes() == r1_p.read_bytes()
+
+    # export-cheats standalone
+    txt_p = tmp_path / "out.txt"
+    assert main(["export-cheats", "-c", "004-BCE-E66", "-o", str(txt_p)]) == 0
+    assert "004-BCE-E66" in txt_p.read_text(encoding="utf-8")
+    capsys.readouterr()  # type: ignore[attr-defined]
+
+    # batch-patch
+    batch_dir = tmp_path / "batch_out"
+    rc_bp = main(
+        [
+            "batch-patch",
+            str(r1_p),
+            str(r2_p),
+            "-c",
+            "004-BCE-E66",
+            "--out-dir",
+            str(batch_dir),
+            "--json",
+        ]
+    )
+    assert rc_bp == 0
+    bp_json = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert len(bp_json) == 2
+    assert all(item["success"] for item in bp_json)
+    assert (batch_dir / "g1.gb").read_bytes()[0x14BC] == 0x00
+    assert (batch_dir / "g2.gb").read_bytes()[0x14BC] == 0x00

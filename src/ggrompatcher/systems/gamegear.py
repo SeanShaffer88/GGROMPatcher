@@ -8,6 +8,7 @@ from typing import Any
 from ggrompatcher.models import (
     CandidateOffset,
     ChecksumEntry,
+    CodeFormatError,
     ConsoleSystem,
     DecodedCode,
     RomInfo,
@@ -79,7 +80,18 @@ class _Sega8BitHandler(SystemHandler):
             description=description,
         )
 
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
+        if code_format.strip().lower() != "gg":
+            raise CodeFormatError(
+                f"{self.system.display_name} ROM patching only supports Game Genie ('gg') encoding."
+            )
         return encode_gb_gg_code(
             address=address,
             value=value,

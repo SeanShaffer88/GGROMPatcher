@@ -67,6 +67,16 @@ def _build_fake_tk() -> tuple[types.ModuleType, dict[str, Any]]:
         def set(self, *_args: Any) -> None:
             pass
 
+    class FakeToplevel(FakeWidget):
+        def title(self, _t: str) -> None:
+            pass
+
+        def geometry(self, _g: str) -> None:
+            pass
+
+        def destroy(self) -> None:
+            pass
+
     class FakeText(FakeWidget):
         def __init__(self, master: Any = None, **kwargs: Any) -> None:
             super().__init__(master, **kwargs)
@@ -181,6 +191,7 @@ def _build_fake_tk() -> tuple[types.ModuleType, dict[str, Any]]:
 
     tk_mod = types.ModuleType("tkinter")
     tk_mod.Tk = FakeTk  # type: ignore[attr-defined]
+    tk_mod.Toplevel = FakeToplevel  # type: ignore[attr-defined]
     tk_mod.StringVar = FakeVar  # type: ignore[attr-defined]
     tk_mod.BooleanVar = FakeVar  # type: ignore[attr-defined]
     tk_mod.Text = FakeText  # type: ignore[attr-defined]
@@ -208,6 +219,8 @@ def _build_fake_tk() -> tuple[types.ModuleType, dict[str, Any]]:
         return str(val.pop(0) if isinstance(val, list) else val)
 
     fd_mod.askopenfilename = _askopen  # type: ignore[attr-defined]
+    fd_mod.askopenfilenames = lambda **_kw: tuple(state.get("askopenfiles", ()))  # type: ignore[attr-defined]
+    fd_mod.askdirectory = lambda **_kw: str(state.get("askdir", ""))  # type: ignore[attr-defined]
     fd_mod.asksaveasfilename = _asksave  # type: ignore[attr-defined]
 
     mb_mod = types.ModuleType("tkinter.messagebox")
@@ -329,4 +342,68 @@ def test_app_widget_wiring_and_actions(tmp_path: Path, monkeypatch: Any) -> None
     # run_app starts mainloop cleanly
     assert app_mod.run_app(str(rom_path)) == 0
     assert state["mainloop_called"] is True
+    assert not state["error"]
+
+
+def test_app_new_tabs_diff_export_bps_batch_and_drop(tmp_path: Path, monkeypatch: Any) -> None:
+    tk_mod, state = _build_fake_tk()
+    monkeypatch.setitem(sys.modules, "tkinter", tk_mod)
+    monkeypatch.setitem(sys.modules, "tkinter.ttk", tk_mod.ttk)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", tk_mod.filedialog)
+    monkeypatch.setitem(sys.modules, "tkinter.messagebox", tk_mod.messagebox)
+    sys.modules.pop("ggrompatcher.gui.app", None)
+
+    app_mod = importlib.import_module("ggrompatcher.gui.app")
+
+    rom1 = make_gb_rom(banks=2)
+    rom1[0x14BC] = 0x03
+    rom2 = make_gb_rom(banks=2)
+    rom2[0x14BC] = 0x03
+    r1 = tmp_path / "one.gb"
+    r2 = tmp_path / "two.gb"
+    r1.write_bytes(bytes(rom1))
+    r2.write_bytes(bytes(rom2))
+
+    cht = tmp_path / "drop.cht"
+    cht.write_text('cheat0_code = "004-BCE-E66"\ncheat0_desc = "HP"\n', encoding="utf-8")
+
+    app = app_mod.GGROMPatcherApp()
+
+    # Drag-and-drop simulation with multi-ROM + cheat file
+    app._handle_dropped_paths([r1, r2, cht])
+    assert app.controller.rom_path == r1
+    assert len(app.controller.entries) == 1
+    assert len(app.controller.batch_rom_paths) == 2
+
+    # Pre-save hex diff preview dialog
+    app._on_preview_diff()
+    assert "0x0014BC" in app._last_diff_preview_text
+
+    # Export cheats & export BPS patch
+    exp_cht = tmp_path / "exported.cht"
+    state["asksave"] = str(exp_cht)
+    app._on_export_cheats()
+    assert exp_cht.is_file()
+
+    exp_bps = tmp_path / "exported.bps"
+    state["asksave"] = str(exp_bps)
+    app._on_export_ips()
+    assert exp_bps.is_file()
+
+    # Batch ROMs tab execution
+    batch_out = tmp_path / "batch_dir"
+    app.batch_out_dir_var.set(str(batch_out))
+    app._on_batch_run(dry_run=False)
+    assert (batch_out / "one.gb").read_bytes()[0x14BC] == 0x00
+    assert (batch_out / "two.gb").read_bytes()[0x14BC] == 0x00
+    assert app.batch_tree.items["0"]["values"][1] == "OK"
+
+    # PAR encoding via Converter tab
+    app.conv_system_var.set("NES / Famicom")
+    app.conv_format_var.set("Pro Action Replay / Rocky (par)")
+    app.conv_addr_var.set("0x9123")
+    app.conv_val_var.set("0xBD")
+    app.conv_cmp_var.set("0xDE")
+    app._on_conv_encode()
+    assert app.conv_encode_out_var.get() == "15C93C0A"
     assert not state["error"]

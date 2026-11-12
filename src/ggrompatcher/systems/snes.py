@@ -233,7 +233,38 @@ class SnesHandler(SystemHandler):
             return 78
         return 0
 
+    def _decode_par(self, raw_code: str, body: str, description: str) -> DecodedCode:
+        clean = clean_code_chars(body.replace(":", ""))
+        if len(clean) != 8 or any(ch not in "0123456789ABCDEF" for ch in clean):
+            raise CodeFormatError(
+                f"Invalid SNES Pro Action Replay code '{raw_code}': "
+                "expected 8 hex digits (e.g. PAR:808000EA or PAR:808000:EA)."
+            )
+        address = int(clean[:6], 16)
+        data = int(clean[6:], 16)
+        bank = (address >> 16) & 0xFF
+        off = address & 0xFFFF
+        if bank in (0x7E, 0x7F) or ((bank & 0x7F) <= 0x3F and off < 0x2000):
+            raise CodeFormatError(
+                f"SNES Pro Action Replay code '{raw_code}' targets WRAM "
+                f"(0x{address:06X}), not cartridge ROM."
+            )
+        return DecodedCode(
+            raw_code=raw_code.strip(),
+            normalized_code=f"PAR:{address:06X}:{data:02X}",
+            system=self.system,
+            address=address,
+            value=bytes([data]),
+            compare=None,
+            description=description,
+        )
+
     def decode_code(self, code: str, description: str = "") -> DecodedCode:
+        raw_upper = code.strip().upper()
+        for prefix in ("PAR:", "AR:", "PAR ", "AR "):
+            if raw_upper.startswith(prefix):
+                return self._decode_par(code, raw_upper[len(prefix) :], description)
+
         clean = clean_code_chars(code)
         if len(clean) != 8:
             raise CodeFormatError(
@@ -272,7 +303,14 @@ class SnesHandler(SystemHandler):
             description=description,
         )
 
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
         if not 0 <= address <= 0xFFFFFF:
             raise CodeFormatError(
                 f"Address 0x{address:06X} out of 24-bit SNES range (0x000000-0xFFFFFF)."
@@ -282,7 +320,15 @@ class SnesHandler(SystemHandler):
                 f"Replacement value 0x{value:X} must be an 8-bit byte (0x00-0xFF)."
             )
         if compare is not None:
-            raise CodeFormatError("SNES Game Genie codes do not support a compare byte.")
+            raise CodeFormatError("SNES Game Genie/PAR codes do not support a compare byte.")
+
+        fmt = code_format.strip().lower()
+        if fmt in {"par", "ar"}:
+            return f"PAR:{address:06X}:{value:02X}"
+        if fmt != "gg":
+            raise CodeFormatError(
+                f"Unsupported SNES code format '{code_format}'. Use 'gg' or 'par'."
+            )
 
         enc_addr = (
             (((address >> 12) & 0xF) << 20)

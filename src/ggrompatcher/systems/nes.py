@@ -18,6 +18,42 @@ from ggrompatcher.systems.base import SystemHandler, clean_code_chars
 NES_ALPHABET = "APZLGITYEOXUKSVN"
 _NES_CHAR_TO_VAL = {ch: idx for idx, ch in enumerate(NES_ALPHABET)}
 _INES_MAGIC = b"NES\x1a"
+_HEX_CHARS = frozenset("0123456789ABCDEF")
+_ROCKY_SHIFTS = (
+    3,
+    13,
+    14,
+    1,
+    6,
+    9,
+    5,
+    0,
+    12,
+    7,
+    2,
+    8,
+    10,
+    11,
+    4,
+    19,
+    21,
+    23,
+    22,
+    20,
+    17,
+    16,
+    18,
+    29,
+    31,
+    24,
+    26,
+    25,
+    30,
+    27,
+    28,
+)
+_ROCKY_KEY = 0x7E5EE93A
+_ROCKY_XOR = 0x5C184B91
 
 # Common PRG-ROM bank granularities by iNES mapper number.
 _MAPPERS_8K = frozenset(
@@ -198,12 +234,90 @@ class NesHandler(SystemHandler):
             return 75
         return 0
 
+    def _decode_rocky(self, raw_code: str, clean_hex: str, description: str) -> DecodedCode:
+        if len(clean_hex) != 8 or not all(ch in _HEX_CHARS for ch in clean_hex):
+            raise CodeFormatError(
+                f"Invalid NES Pro Action Rocky code '{raw_code}': expected 8 hex digits "
+                "(e.g. 15C93C0A or PAR:9123?DE:BD)."
+            )
+        enc = int(clean_hex, 16) >> 1
+        key = _ROCKY_KEY
+        decoded = 0
+        for i in range(30, -1, -1):
+            if (key ^ enc) & 0x40000000:
+                decoded |= 1 << _ROCKY_SHIFTS[i]
+                key ^= _ROCKY_XOR
+            enc = (enc << 1) & 0xFFFFFFFF
+            key = (key << 1) & 0xFFFFFFFF
+
+        address = (decoded & 0x7FFF) | 0x8000
+        compare = (decoded >> 16) & 0xFF
+        value = (decoded >> 24) & 0xFF
+        return DecodedCode(
+            raw_code=raw_code.strip(),
+            normalized_code=clean_hex,
+            system=self.system,
+            address=address,
+            value=bytes([value]),
+            compare=bytes([compare]),
+            description=description,
+        )
+
+    def _decode_par_cpu(self, raw_code: str, body: str, description: str) -> DecodedCode:
+        compact = body.strip().upper().replace(" ", "")
+        if ":" in compact:
+            left, val_hex = compact.split(":", 1)
+            if "?" in left:
+                addr_hex, cmp_hex = left.split("?", 1)
+                cmp_bytes: bytes | None = bytes([int(cmp_hex, 16)])
+            else:
+                addr_hex = left
+                cmp_bytes = None
+            addr = int(addr_hex, 16)
+            val = int(val_hex, 16)
+            if not 0 <= val <= 0xFF:
+                raise CodeFormatError(f"NES PAR value out of range: '{raw_code}'.")
+            if addr < 0x8000:
+                raise CodeFormatError(
+                    f"NES Pro Action code '{raw_code}' targets CPU RAM/PPU "
+                    f"(0x{addr:04X} < 0x8000), not cartridge PRG-ROM."
+                )
+            if addr > 0xFFFF:
+                raise CodeFormatError(f"NES address 0x{addr:X} out of 16-bit CPU range.")
+            cmp_part = f"?{cmp_bytes.hex().upper()}" if cmp_bytes else ""
+            return DecodedCode(
+                raw_code=raw_code.strip(),
+                normalized_code=f"PAR:{addr:04X}{cmp_part}:{val:02X}",
+                system=self.system,
+                address=addr,
+                value=bytes([val]),
+                compare=cmp_bytes,
+                description=description,
+            )
+        return self._decode_rocky(raw_code, clean_code_chars(compact), description)
+
     def decode_code(self, code: str, description: str = "") -> DecodedCode:
+        raw_upper = code.strip().upper()
+        for prefix in ("PAR:", "ROCKY:", "AR:"):
+            if raw_upper.startswith(prefix):
+                return self._decode_par_cpu(code, raw_upper[len(prefix) :], description)
+        for prefix in ("PAR ", "ROCKY ", "AR "):
+            if raw_upper.startswith(prefix):
+                return self._decode_par_cpu(code, raw_upper[len(prefix) :], description)
+
         clean = clean_code_chars(code)
+        if (
+            len(clean) == 8
+            and all(ch in _HEX_CHARS for ch in clean)
+            and any(ch not in _NES_CHAR_TO_VAL for ch in clean)
+        ):
+            # Auto-detect Pro Action Rocky when any hex digit/letter isn't in NES Game Genie.
+            return self._decode_rocky(code, clean, description)
+
         if len(clean) not in (6, 8):
             raise CodeFormatError(
                 f"Invalid NES Game Genie code '{code}': expected 6 or 8 letters "
-                "(e.g. SXIOPO or ZEXPYGLA)."
+                "(e.g. SXIOPO or ZEXPYGLA), or 8 hex digits for Pro Action Rocky."
             )
         bad = [ch for ch in clean if ch not in _NES_CHAR_TO_VAL]
         if bad:
@@ -242,12 +356,45 @@ class NesHandler(SystemHandler):
             description=description,
         )
 
-    def encode_code(self, address: int, value: int, compare: int | None = None) -> str:
+    def encode_code(
+        self,
+        address: int,
+        value: int,
+        compare: int | None = None,
+        *,
+        code_format: str = "gg",
+    ) -> str:
         if not 0x8000 <= address <= 0xFFFF:
             raise CodeFormatError(f"Address 0x{address:04X} out of NES PRG space (0x8000-0xFFFF).")
         if not 0 <= value <= 0xFF:
             raise CodeFormatError(
                 f"Replacement value 0x{value:X} must be an 8-bit byte (0x00-0xFF)."
+            )
+
+        fmt = code_format.strip().lower()
+        if fmt in {"par", "rocky"}:
+            if compare is None:
+                raise CodeFormatError(
+                    "NES Pro Action Rocky encoding requires a compare byte (-c / Compare)."
+                )
+            if not 0 <= compare <= 0xFF:
+                raise CodeFormatError(
+                    f"Compare value 0x{compare:X} must be an 8-bit byte (0x00-0xFF)."
+                )
+            d = (address & 0x7FFF) | ((compare & 0xFF) << 16) | ((value & 0xFF) << 24)
+            key = _ROCKY_KEY
+            encoded = 0
+            for i in range(30, -1, -1):
+                bit = d >> _ROCKY_SHIFTS[i]
+                if ((key >> 30) ^ bit) & 1:
+                    encoded |= 2 << i
+                if bit & 1:
+                    key ^= _ROCKY_XOR
+                key = (key << 1) & 0xFFFFFFFF
+            return f"{encoded & 0xFFFFFFFF:08X}"
+        if fmt != "gg":
+            raise CodeFormatError(
+                f"Unsupported NES code format '{code_format}'. Use 'gg' or 'par'."
             )
 
         n0 = ((value >> 4) & 8) | (value & 7)
